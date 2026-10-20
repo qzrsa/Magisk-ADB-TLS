@@ -4,11 +4,12 @@
 #
 # 分工：
 #   system.prop 负责开机早期把 persist.adb.tls_server.enable 置 1，
-#   让 adbd 一起来就带 TLS 能力；本脚本负责三件事：
+#   让 adbd 一起来就带 TLS 能力；本脚本负责四件事：
 #
+#     0. 把 KEYS_DIR 里的客户端公钥合并进 adbd 的 keystore（认证层）
 #     1. 清掉明文通道（service.adb.tcp.port），避免两条通道并存
 #     2. 读 adbd 实际分配的 TLS 端口，用 NAT REDIRECT 把固定端口转发过去
-#     3. 防火墙来源控制 + 后台低频复核（端口变化、明文回潮、规则丢失）
+#     3. 防火墙来源控制 + 后台低频复核（端口变化、明文回潮、规则丢失、新公钥）
 #
 # 设计原则：fail-closed。
 # 拿不到 TLS 端口时不回落到明文 5555 —— 宁可连不上，也不要静默降级。
@@ -22,6 +23,14 @@ verify_loop() {
         sleep "$INTERVAL"
         [ -d "$MODDIR" ] || exit 0
         [ -f "$MODDIR/disable" ] && exit 0
+
+        # 用户往 keys 目录丢了新公钥 —— 写进 keystore 并重启 adbd 使其生效
+        if install_client_keys; then
+            log "INFO: 发现新的客户端公钥，重启 adbd 以重新加载 keystore"
+            restart_adbd
+            _np=$(wait_tls_port 15)
+            valid_port "$_np" && follow_tls_port "$_np"
+        fi
 
         if [ -n "$(getprop service.adb.tcp.port)" ]; then
             log "WARN: 明文通道被重新打开，清除并重启 adbd"
@@ -58,6 +67,20 @@ main() {
     sleep 3
 
     log "conf: port=$PORT mode=$MODE allow4=\"$ALLOW4\" allow6=\"$ALLOW6\" interval=$INTERVAL ensure_wifi_debug=$ENSURE"
+
+    _need=0
+
+    # 0. 认证层：把客户端公钥合并进 adbd 的 keystore
+    #    必须在等 TLS 端口之前做，这样下面的 restart_adbd 能一次同时生效。
+    install_client_keys
+    [ "$?" = "0" ] && _need=1
+
+    _as=$(getprop ro.adb.secure)
+    log "auth: ro.adb.secure=${_as:-?} keystore=$(keystore_count) 条 keys_dir=$KEYS_DIR"
+    case "$_as" in
+        0) log "WARN: ro.adb.secure=0 —— TLS 只加密不认证，任何客户端都能连" ;;
+        *) log "INFO: 认证开启，只有公钥在 keystore 里的客户端才能连" ;;
+    esac
 
     # 1. 清明文通道
     _old=$(getprop service.adb.tcp.port)

@@ -37,6 +37,11 @@ ALLOW4=$(cfg ALLOW4_CIDR "")
 ALLOW6=$(cfg ALLOW6_CIDR "")
 INTERVAL=$(cfg VERIFY_INTERVAL 60)
 ENSURE=$(cfg ENSURE_WIFI_DEBUG 0)
+KEYS_DIR=$(cfg KEYS_DIR /data/adb/adb_tls5555/keys)
+AUTO_KEY=$(cfg KEYS_AUTO_INSTALL 1)
+
+# adbd 的 keystore。TLS 客户端证书的公钥会逐条与这里比对。
+KEYSTORE=/data/misc/adb/adb_keys
 
 case "$PORT" in
     ''|*[!0-9]*) log "WARN: ADB_TLS_PORT 非法，回落 5555"; PORT=5555 ;;
@@ -274,4 +279,122 @@ guard_ok() {
         ip6t -C INPUT -p tcp --dport "$PORT" -j ADB_GUARD6 2>/dev/null || return 1
     fi
     return 0
+}
+
+# ---- 客户端公钥预置：免 6 位配对码 --------------------------------------
+#
+# AOSP 事实链（已核对源码，不是推测）：
+#
+#   client/auth.cpp :: adb_auth_tls_handshake()
+#       客户端拿 ~/.android/adbkey 现场生成一张自签 X509
+#       （GenerateX509Certificate(EVP_PKEY from adbkey)），
+#       所以这张证书的公钥 == 客户端的 ADB 公钥。
+#
+#   daemon/auth.cpp :: adbd_tls_verify_cert()
+#       if (!auth_required) return 1;              // ro.adb.secure=0 时放行一切
+#       IteratePublicKeys(...) → EVP_PKEY_cmp()     // 否则逐条比对 keystore
+#
+#   结论：把客户端的 adbkey.pub **一行**追加进 /data/misc/adb/adb_keys
+#         就等于完成配对。不需要 6 位配对码，也不需要同一局域网，
+#         更不需要那个没法做 NAT 的随机配对端口。
+#
+#   代价：adbd 只在启动时加载 keystore，改完必须重启 adbd。
+#
+
+# 从 KEYS_DIR 收集待授权公钥，只保留第一条字段形如 base64 的行。
+# 一条 ADB 公钥的编码长度是 700 字符（524 字节），阈值取 300 足够宽松。
+collect_keys() {
+    [ -n "$KEYS_DIR" ] && [ -d "$KEYS_DIR" ] || return 0
+    cat "$KEYS_DIR"/*.pub "$KEYS_DIR"/keys.txt 2>/dev/null \
+        | tr -d '\r' \
+        | awk '
+            {
+                line = $0
+                sub(/^[ \t]+/, "", line)
+                sub(/[ \t]+$/, "", line)
+                if (line == "") next
+                k = line
+                sub(/[ \t].*$/, "", k)
+                if (length(k) < 300) next
+                if (k !~ /^[A-Za-z0-9+\/=]+$/) next
+                print line
+            }'
+}
+
+# 返回值：0=有新公钥写入（需要重启 adbd） 1=无需变更 2=未启用/无配置
+install_client_keys() {
+    [ "$AUTO_KEY" = "1" ] || return 2
+
+    _want=$(collect_keys)
+    [ -z "$_want" ] && return 2
+
+    printf '%s\n' "$_want" > "$MODDIR/.keys.want"
+    # awk 的 FNR==NR 判据在「第一个文件为空」时会失效，把第二个文件也当成第一个吃光。
+    # 所以 .keys.cur 至少放一行占位。
+    : > "$MODDIR/.keys.cur"
+    [ -f "$KEYSTORE" ] && tr -d '\r' < "$KEYSTORE" >> "$MODDIR/.keys.cur"
+    [ -s "$MODDIR/.keys.cur" ] || printf '#\n' > "$MODDIR/.keys.cur"
+
+    # 按第一条字段（公钥本体）去重，保留已有顺序
+    _add=$(awk '
+        FNR == NR {
+            k = $0
+            sub(/^[ \t]+/, "", k)
+            sub(/[ \t].*$/, "", k)
+            if (k != "") seen[k] = 1
+            next
+        }
+        {
+            l = $0
+            k = l
+            sub(/[ \t].*$/, "", k)
+            if (k == "" || (k in seen)) next
+            seen[k] = 1
+            print l
+        }' "$MODDIR/.keys.cur" "$MODDIR/.keys.want")
+
+    rm -f "$MODDIR/.keys.want" "$MODDIR/.keys.cur"
+    [ -z "$_add" ] && return 1
+
+    _n=$(printf '%s\n' "$_add" | grep -c .)
+    log "INFO: 预置 $_n 个客户端公钥 → $KEYSTORE"
+
+    mkdir -p /data/misc/adb 2>/dev/null
+    [ -f "$KEYSTORE" ] || : > "$KEYSTORE"
+
+    # 原文件最后一字节不是换行时先补一个，避免两条公钥黏在一行
+    if [ -s "$KEYSTORE" ] && [ "$(tail -c 1 "$KEYSTORE" 2>/dev/null | wc -l)" = "0" ]; then
+        echo >> "$KEYSTORE"
+    fi
+    printf '%s\n' "$_add" >> "$KEYSTORE"
+    # adbd 对这个文件的属主/权限/SELinux 标签有要求，缺一不可
+    chown shell:shell "$KEYSTORE" 2>/dev/null
+    chmod 0640 "$KEYSTORE" 2>/dev/null
+    restorecon "$KEYSTORE" >/dev/null 2>&1 \
+        || chcon u:object_r:adb_keys_file:s0 "$KEYSTORE" 2>/dev/null
+
+    return 0
+}
+
+# keystore 里已授权的客户端数量
+keystore_count() {
+    if [ -f "$KEYSTORE" ]; then
+        _c=$(grep -c '[A-Za-z0-9]' "$KEYSTORE" 2>/dev/null)
+        printf '%s' "${_c:-0}"
+    else
+        printf '0'
+    fi
+}
+
+# 逐条列出已授权客户端（公钥前 16 位 + user@host 备注）
+list_keystore() {
+    [ -f "$KEYSTORE" ] || return 0
+    awk '
+        {
+            k = $1
+            if (length(k) < 20) next
+            c = $2
+            if (c == "") c = "(无备注)"
+            printf "    %.16s…  %s\n", k, c
+        }' "$KEYSTORE" 2>/dev/null
 }

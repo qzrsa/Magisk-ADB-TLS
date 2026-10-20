@@ -2,7 +2,7 @@
 
 Magisk 模块：**开机确保 `adbd` 以 TLS 模式监听，并把固定的 `5555` 端口转发到它的实际端口，同时关闭明文 TCP 通道。**
 
-认证由 `adbd` 内置的 TLS 配对完成——`adb pair` 一次，之后长期免密。模块本身**不含任何密码逻辑**，也不加任何二进制。
+认证走 `adbd` 的 **TLS 客户端证书校验**：把控制端的 `adbkey.pub` 放进指定目录即可，不需要 6 位配对码，也不需要同一局域网。模块本身**不含任何密码逻辑**，也不加任何二进制。
 
 > 本项目是 [Magisk-ADB-TCP-5555](https://github.com/qzrsa/Magisk-ADB-TCP-5555) 的安全向变体。那个模块解决"开机即用"，本项目解决"开机即用 **且** 可以放到公网"。
 
@@ -13,20 +13,24 @@ Magisk 模块：**开机确保 `adbd` 以 TLS 模式监听，并把固定的 `55
 | 维度 | Magisk-ADB-TCP-5555 | **本项目** |
 |---|---|---|
 | 通道 | 明文 TCP | TLS 1.3 |
-| 认证 | RSA 挑战应答（默认可关） | TLS 配对证书（不可关） |
-| 陌生人能做什么 | 连上、停在 `unauthorized` | **握手阶段就失败** |
+| 认证 | RSA 挑战应答（`ro.adb.secure=0` 可直接关掉） | TLS 客户端证书校验（不可关，除非显式改回 0） |
+| 陌生人能做什么 | 连上、停在 `unauthorized`；认证关掉时直接拿到 root shell | **握手阶段就失败** |
 | 传输内容可见 | 是 | 否 |
-| 是否需要申请证书 | — | 不需要，adbd 自己生成 |
+| 是否需要申请证书 | — | 不需要，两端自签 |
 | 端口 | 固定 5555（属性可注入） | adbd 随机选，模块用 NAT 映射回 5555 |
 | 额外组件 | 无 | 无 |
 
-一句话：**原模块把门打开；本项目把门换成只有配过对的人才能推开的门，而且换了个固定门牌号。**
+一句话：**原模块把门打开；本项目把门换成只有持有私钥的人才能推开的门，而且换了个固定门牌号。**
 
 ---
 
-## 原理：为什么不能直接注入 TLS 端口
+## 两个必须知道的事实
 
-`service.adb.tls.port` 和我们直觉相反——**它是 adbd 的输出，不是输入**。实际流程是：
+这两条是读 AOSP 源码核对的，也是本项目全部设计的依据。
+
+### 一、`service.adb.tls.port` 是 adbd 的**输出**，不是输入
+
+实际流程：
 
 1. 框架（`AdbDebuggingManager`）判断「无线调试」允许开启；
 2. 调用 adbd 的 `enable_wifi_debugging()`；
@@ -49,6 +53,33 @@ Magisk 模块：**开机确保 `adbd` 以 TLS 模式监听，并把固定的 `55
 
 **TLS 仍然是端到端的**：NAT 只改目的端口号，不接触内容，所以客户端依然和 adbd 直接完成 TLS 握手，中间没有任何解密环节，也不需要额外进程。
 
+### 二、TLS 端口是 **STARTTLS 升级**，不是"一上来就握手"
+
+`daemon/main.cpp → handle_packet()` 的实际行为：
+
+```
+客户端 ──A_CNXN（明文）──► adbd
+客户端 ◄──A_STLS（明文）── adbd      ← 服务端说"我们换加密"
+        ══ TLS 1.3 握手 ══
+客户端 ──A_CNXN（密文）──► adbd
+客户端 ◄──A_CNXN / A_AUTH ─ adbd
+```
+
+**推论（很重要）**：任何只会处理 `A_CNXN` / `A_AUTH` 的裸协议客户端，在第二步收到 `A_STLS` 就废了——它既不会握手，也不会重发 `CNXN`。这正是"原模块能连、加 TLS 就连不上"的原因：**不是服务端坏了，是客户端不认这条升级指令。** 只有真正的 `adb`（含 TLS 栈）能走完。
+
+### 三、认证 = 客户端证书的公钥要与 `adb_keys` 里的某一条相同
+
+| 环节 | 源码位置 | 行为 |
+|---|---|---|
+| 客户端出证书 | `client/auth.cpp::adb_auth_tls_handshake()` | 用 `~/.android/adbkey` 现场生成自签 X509，**证书公钥 == adbkey 公钥** |
+| 服务端验证书 | `daemon/auth.cpp::adbd_tls_verify_cert()` | `if (!auth_required) return 1;` → 否则逐条 `EVP_PKEY_cmp` 比对 `/data/misc/adb/adb_keys` |
+| 客户端验服务端 | `transport.cpp` | 回调直接 `return 1`，即**不校验**设备证书 |
+
+由此得到两个可直接利用的结论：
+
+1. **不需要 CA、不需要域名、不需要配对码**——信任关系就是一行公钥。
+2. **`ro.adb.secure=0` 时 `auth_required=false`，TLS 只加密不认证**（源码注释原话：`// Any key will do.`）。所以本模块显式把 `ro.adb.secure` 设为 `1`。
+
 ### 失败时不会降级
 
 拿不到 TLS 端口（例如「无线调试」被关闭）时，模块只记 `FAIL` 并继续等待，**不会**回落到明文 5555。宁可连不上，也不要静默变成无加密通道。
@@ -64,14 +95,22 @@ Magisk 模块：**开机确保 `adbd` 以 TLS 模式监听，并把固定的 `55
 
 > 如果你装了 `adb_tcp5555`（明文版），**先卸载它**。
 
-装完点模块卡片的「操作」按钮，可以看到实际端口与转发状态：
+装完点模块卡片的「操作」按钮，可以看到实际端口、转发状态和认证状态：
 
 ```
---- adb_tls5555 ---
+--- adb_tls5555 v1.2.0 ---
+--- 属性 ---
 service.adb.tls.port          = 39073
 service.adb.tcp.port          =
 persist.adb.tls_server.enable = 1
 对外端口 ADB_TLS_PORT         = 5555（NAT 转发到上面的实际端口）
+--- 认证 ---
+ro.adb.secure                 = 1
+ro.secure                     = 0
+keystore /data/misc/adb/adb_keys = 1 条
+状态: 认证开启 —— 客户端公钥必须在 keystore 里，否则 TLS 握手失败
+已授权客户端:
+    AAAA...（前 16 位）…  user@host
 --- nat ---
 -A PREROUTING -p tcp -m tcp --dport 5555 -j REDIRECT --to-ports 39073
 转发状态: 就绪（5555 → 39073）
@@ -79,31 +118,97 @@ persist.adb.tls_server.enable = 1
 
 ---
 
-## 首次配对（只做一次）
+## 认证：让控制端进来
 
-配对需要**看到手机屏幕**，请在局域网内完成，不要在公网做。
+`adbd` 只认一件事：**客户端的 TLS 证书公钥，是否出现在 `/data/misc/adb/adb_keys` 里**。让某个公钥出现在那里，有两条路。
 
-1. 手机：设置 → 关于手机 → 连点「版本号」进开发者选项 → 打开 **无线调试**
-2. 点进「使用配对码配对设备」，记下**配对端口**（与 5555 无关）和 6 位码
-3. 控制端执行：
+### 方式一：预置公钥（推荐，不需要配对码）
+
+模块会读 `/data/adb/adb_tls5555/keys/` 下的 `*.pub` 和 `keys.txt`，把里面的公钥合并进 `adb_keys`，然后自动重启 adbd 生效。
+
+**第 1 步：拿到控制端的公钥**
 
 ```bash
-adb pair <手机IP>:<配对端口>
+# 路径（第一次运行 adb 时自动生成，已存在就不要动它）
+#   Windows:    %USERPROFILE%\.android\adbkey.pub
+#   macOS/Linux: ~/.android/adbkey.pub
+cat ~/.android/adbkey.pub
+# 输出形如：AAAA...（700 字符 base64） user@host
+```
+
+**第 2 步：放进手机的公钥目录**
+
+任选一种：
+
+```bash
+# A. 你已经能用 USB adb 连上手机（最简单）
+adb push ~/.android/adbkey.pub /data/local/tmp/
+adb shell su -c 'mkdir -p /data/adb/adb_tls5555/keys && cp /data/local/tmp/adbkey.pub /data/adb/adb_tls5555/keys/'
+```
+
+```
+# B. 用带 root 的文件管理器（MT 管理器 / FX / Solid Explorer）
+把 adbkey.pub 直接复制到 /data/adb/adb_tls5555/keys/
+```
+
+```
+# C. 手机上装个 root 终端（Termux + su），把公钥内容粘进去
+su -c 'mkdir -p /data/adb/adb_tls5555/keys && cat > /data/adb/adb_tls5555/keys/pc.pub'
+# 粘贴那一整行，回车，Ctrl-D
+```
+
+**第 3 步：让它生效**
+
+点模块卡片的「操作」按钮即可（后台复核也会在一个周期内发现新公钥并自动处理）。日志里会出现：
+
+```
+INFO: 预置 1 个客户端公钥 → /data/misc/adb/adb_keys
+INFO: 发现新的客户端公钥，重启 adbd 以重新加载 keystore
+```
+
+**第 4 步：连**
+
+```bash
+adb connect <手机公网IP>:5555
+adb devices     # 应显示 <IP>:5555   device
+```
+
+> 公钥目录权限是 `0700`，只有 root 能读。这是故意的——如果改成从 `/sdcard` 读，任何有存储权限的 App 都能塞一个自己的公钥进来拿到 root。
+
+### 方式二：`adb pair`（官方流程，需要同一局域网）
+
+配对端口是**另一个随机端口**，没有固定值，也没法做 NAT，所以只能在局域网内做一次。
+
+1. 手机：开发者选项 → **无线调试** → 打开
+2. 点进「使用配对码配对设备」，记下**配对端口**和 6 位码
+3. 控制端：
+
+```bash
+adb pair <手机局域网IP>:<配对端口>
 # 输入手机屏幕上的 6 位数字
+adb connect <手机公网IP>:5555      # 注意：这里用 5555，不是配对端口
 ```
 
-4. 配对成功后连接固定的对外端口：
+配对关系和方式一写进 `adb_keys` 的东西完全等价，长期有效（换 ROM / 清数据才会丢）。
 
-```bash
-adb connect <手机IP>:5555
-adb devices        # 应显示 <IP>:5555   device
+### 为什么不需要申请证书
+
+两端都是**自签名证书**，信任来自"公钥在不在 `adb_keys` 里"，不来自任何 CA。所以不需要域名、不需要花钱、不需要续期，公网 IP 变了也不影响。
+
+### 千万不要用 `ro.adb.secure=0` 图省事
+
+很多教程让你加 `ro.adb.secure=0` 来"免认证"。在 TLS 语境下它的含义是：
+
+```c
+// daemon/auth.cpp
+int adbd_tls_verify_cert(X509_STORE_CTX* ctx, std::string* auth_key) {
+    if (!auth_required) {
+        // Any key will do.
+        return 1;
+    }
 ```
 
-配对信息长期有效，之后不需要再配对（除非清数据 / 换 ROM）。
-
-### 为什么不用申请证书
-
-TLS 用的是**自签名证书 + 配对后固定（pinning）**：证书由 adbd 在设备上自己生成，信任来自你亲眼看过屏幕上那 6 位码，而不是第三方 CA。所以不需要域名、不需要花钱、不需要续期，公网 IP 变了也不影响。
+**任何人连上来都会被放行。** 通道是加密的，但对面是谁完全不管——等于把 root shell 挂在一个只有 `https://` 前缀的空门上。本模块的 `system.prop` 显式写 `ro.adb.secure=1`。
 
 ---
 
@@ -126,6 +231,8 @@ adb connect <手机IP>:5555
 ```bash
 su -c 'cat /data/adb/modules/adb_tls5555/adb_tls.log'
 su -c 'iptables -t nat -S PREROUTING | grep 5555'
+su -c 'getprop ro.adb.secure; getprop ro.secure'
+su -c 'wc -l /data/misc/adb/adb_keys'
 ```
 
 正常日志：
@@ -133,6 +240,9 @@ su -c 'iptables -t nat -S PREROUTING | grep 5555'
 ```
 ===== service.sh 启动 =====
 conf: port=5555 mode=all ...
+INFO: 预置 1 个客户端公钥 → /data/misc/adb/adb_keys
+auth: ro.adb.secure=1 keystore=1 条 keys_dir=/data/adb/adb_tls5555/keys
+INFO: 认证开启，只有公钥在 keystore 里的客户端才能连
 INFO: adbd TLS 端口 = 39073
 INFO: TLS 端口 无 → 39073，已重建转发（外部 5555）
 OK: 5555 → 39073 转发就绪
@@ -156,6 +266,8 @@ INFO: 已启动后台复核，间隔 60s
 | `ALLOW6_CIDR` | 空 | `lan` 模式下放行的 IPv6 网段；空表示 v6 只放行 lo |
 | `VERIFY_INTERVAL` | `60` | 后台复核间隔（秒）；`0` 关闭复核 |
 | `ENSURE_WIFI_DEBUG` | `0` | 取不到 TLS 端口时是否自动打开系统「无线调试」开关 |
+| `KEYS_AUTO_INSTALL` | `1` | 是否自动把 `KEYS_DIR` 里的公钥合并进 `adb_keys`（`0` 关闭，只用 `adb pair`） |
+| `KEYS_DIR` | `/data/adb/adb_tls5555/keys` | 待授权公钥目录；读 `*.pub` 与 `keys.txt` |
 
 三种模式怎么选：
 
@@ -173,12 +285,14 @@ INFO: 已启动后台复核，间隔 60s
 
 | 层 | 措施 |
 |---|---|
-| 通道 | TLS 1.3（adbd 内置） |
-| 身份 | 配对证书 + pinning，无法暴力枚举 |
+| 通道 | TLS 1.3（adbd 内置），端到端，NAT 不解密 |
+| 身份 | 客户端证书公钥必须在 `/data/misc/adb/adb_keys`，逐条 `EVP_PKEY_cmp` 比对 |
+| 抗扫描 | 没有正确私钥的握手在 TLS 阶段就被丢弃，`adbd` 不会执行任何 ADB 命令 |
 | 明文通道 | 启动时清除 + 后台复核，发现回潮即关 |
+| 认证强制 | `ro.adb.secure=1` 写死在 `system.prop`，不会因 `ro.secure=0` 而被绕过 |
 | 暴露面 | `GUARD_MODE` 控制对外端口的来源；`all` 时依赖 TLS |
 | 失败行为 | fail-closed，不回落明文 |
-| 撤销 | 手机端「撤销 USB 调试授权」，控制端重新 `adb pair` |
+| 撤销 | 编辑 `/data/misc/adb/adb_keys` 删掉对应行，重启 adbd（或 `adb shell su -c 'setprop ctl.restart adbd'`） |
 
 ### 已知的残留暴露面
 
@@ -218,10 +332,12 @@ iptables -A INPUT -p tcp --dport 39073 -j DROP
 | 现象 | 排查 |
 |---|---|
 | `Connection refused` | 对外端口无人转发 → 点「操作」看「转发状态」，查 `iptables -t nat -S PREROUTING \| grep 5555` |
-| `failed to authenticate` | 没配对过，或清了 `/data/misc/adb/` → 重新 `adb pair` |
-| `adb connect` 卡住 | adb 版本 < 30，不支持 TLS 客户端 |
-| 配对成功但连不上 | 确认连的是 `5555`（对外端口），不是配对端口 |
+| `failed to authenticate` / `TLS handshake failed` | 客户端公钥不在 `adb_keys` 里 → 按「认证」一节预置公钥，或 `adb pair` |
+| `adb connect` 卡住 | adb 版本 < 30，不支持 TLS 客户端；或对面不是真 `adb`（见下节） |
+| 连上了但不是 `device` | `ro.adb.secure=0` 之外还有别的认证关闭路径，检查 `getprop ro.adb.secure` |
 | 端口一会儿通一会儿不通 | adbd 的随机端口变了而复核还没跟上 → 调小 `VERIFY_INTERVAL`，或点「操作」立即重建 |
+
+判据：**「操作」里 `keystore` 条数 ≥ 1 且 `ro.adb.secure=1`，才算认证链路完整。**
 
 ### 「转发状态: 未就绪」
 
@@ -238,9 +354,28 @@ iptables -A INPUT -p tcp --dport 39073 -j DROP
 
 Android 的 iptables 走 nft 后端，**NAT 目标不能放在用户自定义链里**。这就是 v1.1.0 失败的原因：跳转规则建成功、链是空的，看着有规则却不转发。v1.1.1 起直接把 REDIRECT 写进 `PREROUTING`，不再用中间链。
 
-### 控制端是自研 App
+### 控制端是自研 App：为什么它一定连不上
 
-`adb pair` / `adb connect` 之外的自研客户端（例如自己实现的 raw ADB 协议）**默认不支持 TLS**，需要在客户端补 `SSLSocket` + 客户端证书 + 服务端 pinning。否则只能退回明文通道或 WireGuard 方案。
+这是本项目最容易踩的坑，也是"原模块能连、加 TLS 就连不上"最常见的原因。
+
+`adbd` 的 TLS 端口是 **STARTTLS 升级**：客户端先发明文 `A_CNXN`，服务端回 `A_STLS`，双方才切 TLS，然后客户端要在隧道里**重发一次** `A_CNXN`。
+
+```java
+// 典型自研客户端的握手代码长这样
+channel.write(AdbProtocol.generateConnect());       // A_CNXN
+AdbMessage message = AdbMessage.parse(channel);     // 期望 A_CNXN 或 A_AUTH
+// ← 这里收到的是 A_STLS，解析失败 / 被忽略 / 永远等不到下一步
+```
+
+自研客户端通常只实现 `A_CNXN` / `A_AUTH` / `A_OKAY`，**没有 `A_STLS` 分支，也没有 TLS 栈**，所以必定卡在第二个包。
+
+只有三条出路：
+
+1. **换成真正的 `adb`**（PC 上的 platform-tools ≥ 30）。原生支持，零改动。
+2. **不用原生 TLS**：设备端跑一个 TLS 网关（固定端口 + 自签证书 + 客户端证书校验），App 里用 `SSLSocket` 包一层，ADB 字节流原样透传。客户端约 30 行代码，服务端需要额外二进制。
+3. **放弃加密**：回到明文 + 来源白名单 / WireGuard / SSH 隧道。
+
+模块本身不解决第 2、3 条——它只负责把 `adbd` 的 TLS 端口变成固定端口，并保证认证链路完整。
 
 ---
 
@@ -254,6 +389,8 @@ Android 的 iptables 走 nft 后端，**NAT 目标不能放在用户自定义链
 - 重启 adbd，回到纯 USB 模式
 
 配置 `/data/adb/adb_tls5555.conf` 会保留，需手动删除。
+
+**`/data/misc/adb/adb_keys` 里的公钥不会被删**——那是系统文件，可能还有 USB 授权等其他来源。要撤销某个客户端，编辑该文件删掉对应行后重启 adbd。
 
 ---
 

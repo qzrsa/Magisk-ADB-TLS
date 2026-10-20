@@ -93,3 +93,7 @@ rm -f "$MODDIR/adb_tls.log" "$MODDIR/.tls_port" 2>/dev/null
 
 echo "adb_tls5555 已移除：NAT 与防火墙已拆除，adbd 已回 USB 模式"
 echo "配置保留在 $CONF，如需彻底清理可手动删除"
+echo ""
+echo "注意：本模块预置进 /data/misc/adb/adb_keys 的客户端公钥**不会**被删除"
+echo "      （那是系统文件，可能还有其他来源的公钥）。"
+echo "      要撤销某个客户端的授权，编辑该文件删掉对应行后重启 adbd。"

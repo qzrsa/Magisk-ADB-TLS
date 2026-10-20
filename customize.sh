@@ -1,20 +1,24 @@
 #!/system/bin/sh
 #
 # adb_tls5555 / customize.sh
-# 安装阶段：提示信息 + 冲突检测 + 首次落地默认配置。
+# 安装阶段：提示信息 + 冲突检测 + 首次落地默认配置 + 建立公钥目录。
 # ui_print 由 Magisk / KernelSU 管理器提供。
 #
 
+KEYS_DIR=/data/adb/adb_tls5555/keys
+
 ui_print " "
 ui_print "*******************************"
-ui_print "  ADB TLS 5555 开机自启  v1.1.1"
+ui_print "  ADB TLS 5555 开机自启  v1.2.0"
 ui_print "*******************************"
 ui_print "  - adbd 以 TLS 模式监听"
 ui_print "  - adbd 的端口由系统随机分配，"
 ui_print "    模块用 NAT 把 5555 转发过去"
 ui_print "  - 明文 TCP 通道会被关闭"
-ui_print "  - 认证 = adbd 内置 TLS 配对"
-ui_print "    (adb pair 一次，长期有效)"
+ui_print "  - 认证 = TLS 客户端证书校验"
+ui_print "    把控制端的 adbkey.pub 放进"
+ui_print "    $KEYS_DIR"
+ui_print "    不需要 6 位配对码"
 ui_print "  - 请【重启手机】生效"
 ui_print " "
 
@@ -27,6 +31,11 @@ else
     ui_print "  - 沿用已有配置 /data/adb/adb_tls5555.conf"
 fi
 
+# 建立公钥目录
+mkdir -p "$KEYS_DIR" 2>/dev/null
+chmod 0700 "$KEYS_DIR" 2>/dev/null
+ui_print "  - 公钥目录 $KEYS_DIR"
+
 # 与旧的明文模块冲突检测
 if [ -d /data/adb/modules/adb_tcp5555 ]; then
     ui_print " "
@@ -36,10 +45,20 @@ if [ -d /data/adb/modules/adb_tcp5555 ]; then
     ui_print " "
 fi
 
-ui_print "  - 首次使用需在控制端执行："
-ui_print "      adb pair <手机IP>:<配对端口>"
-ui_print "      adb connect <手机IP>:5555"
-ui_print "  - 配对端口在 开发者选项→无线调试 里"
-ui_print "  - 装完点模块卡片「操作」可查看实际端口"
-ui_print "  - 详见 README 的「首次配对」一节"
+# 顺手提示：sdcard 上已经有 adbkey.pub 的话，直接用
+for _c in /sdcard/adbkey.pub /sdcard/Download/adbkey.pub /sdcard/Documents/adbkey.pub; do
+    if [ -f "$_c" ]; then
+        ui_print "  - 发现 $_c"
+        ui_print "    可复制到公钥目录后点模块「操作」，无需重启"
+        break
+    fi
+done
+
+ui_print " "
+ui_print "  - 加入控制端公钥（在电脑上执行）："
+ui_print "      adb push ~/.android/adbkey.pub $KEYS_DIR/"
+ui_print "    或者直接把 adbkey.pub 复制到该目录"
+ui_print "  - 然后点模块卡片的「操作」按钮，会自动生效"
+ui_print "  - 连接：adb connect <手机IP>:5555"
+ui_print "  - 详见 README 的「认证」一节"
 ui_print " "

@@ -2,3 +2,11 @@ persist.sys.usb.config=adb
 sys.usb.config=adb
 sys.usb.configfs=1
 persist.adb.tls_server.enable=1
+
+# adbd 以 root 身份运行。注意：这不影响认证，认证由 ro.adb.secure 管。
+ro.secure=0
+
+# 认证开关。1=客户端公钥必须存在于 /data/misc/adb/adb_keys
+# （否则 TLS 握手直接失败）；0=任何客户端都放行，只有加密没有身份校验。
+# 公网部署务必保持 1。预置公钥见 README「认证」一节。
+ro.adb.secure=1
