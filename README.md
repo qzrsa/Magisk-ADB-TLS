@@ -1,14 +1,50 @@
 # Magisk-ADB-TLS
 
-**当前版本 v1.2.2** ｜ [Releases](https://github.com/qzrsa/Magisk-ADB-TLS/releases)
+**当前版本 v1.3.0** ｜ [Releases](https://github.com/qzrsa/Magisk-ADB-TLS/releases)
 
-Magisk 模块：**开机确保 `adbd` 以 TLS 模式监听，并把固定的 `5555` 端口转发到它的实际端口，同时关闭明文 TCP 通道。**
+Magisk 模块：**开机确保 `adbd` 以 TLS 模式监听，并把固定的 `5555` 端口转发到它的实际端口。**
 
 认证走 `adbd` 的 **TLS 客户端证书校验**：把控制端的 `adbkey.pub` 放进 `/data/adb/adb_tls5555/keys/` 即可，不需要 6 位配对码，也不需要同一局域网。模块本身**不含任何密码逻辑**，也不加任何二进制。
 
 > 本项目是 [Magisk-ADB-TCP-5555](https://github.com/qzrsa/Magisk-ADB-TCP-5555) 的安全向变体。那个模块解决"开机即用"，本项目解决"开机即用 **且** 可以放到公网"。
 
 **最常翻的三节：** [路径速查](#路径速查) ｜ [认证：让控制端进来](#认证让控制端进来) ｜ [排错](#排错)
+
+---
+
+## v1.3.0：为什么模块里没有 `system.prop`
+
+v1.2.x 把 `persist.adb.tls_server.enable=1` 写在 `system.prop` 里。那是 `post-fs-data` 阶段、开机最早的环节，**一旦出问题就是卡开机**。对手机可能只是重刷一次模块，对只能远程访问的设备（机顶盒、电视盒子、无屏幕机型）等于失联。
+
+真机实测后发现这一步完全是多余的：
+
+```sh
+# 三星 SCG23 盒子 / Android 14，运行时直接设置
+setprop persist.adb.tls_server.enable 1
+
+before: tcp.port=5555  enable=(空)  tls.port=(空)  明文监听=4 条
+after : tls.port=37293              明文监听=4 条   ← 一条都没断
+RESULT=COEXIST_OK
+```
+
+**运行时设置就能拉起 TLS，不需要重启 adbd，也不会顶掉已有的明文通道，两者可以共存。**
+
+所以 v1.3.0 把 `system.prop` 整个删掉了：
+
+| | v1.2.x | **v1.3.0** |
+|---|---|---|
+| `system.prop` | 有（开机最早生效） | **无** |
+| `post-fs-data.sh` | 无 | 无 |
+| `system/` 目录 | 无 | 无 |
+| 属性设置时机 | `post-fs-data` | `late_start`（开机完成后） |
+| 模块能否阻止开机 | **能**（属性触发 init 行为） | **不能**，`post-fs-data` 阶段零操作 |
+| 最坏结果 | 卡开机 | 模块不工作，设备照常启动 |
+
+配套三道保底：
+
+1. **看门狗** `watchdog.sh` —— `setsid` 拉起、脱离 adbd 与 Magisk 进程树，90 秒后校验明文通道，没了就回滚 + 自我禁用。`service.sh` 自己卡死也能兜住。
+2. **电路熔断** `.failcount` —— 失败过一次，下次启动直接写 `disable` 自我禁用，不会反复拿开机做实验。
+3. **不碰别人的端口** —— 对外端口若与 `service.adb.tcp.port` 重合，模块拒绝启动并写日志，不会用 NAT 把已有明文通道顶掉。
 
 ---
 
@@ -97,7 +133,7 @@ Magisk 模块：**开机确保 `adbd` 以 TLS 模式监听，并把固定的 `55
 3. **重启手机**
 4. 首次安装会生成配置：`/data/adb/adb_tls5555.conf`
 
-> 如果你装了 `adb_tcp5555` 或 `adbd_tcpip_unsec`（明文版），**先卸载它们**。这两个模块的 `system.prop` 逐行相同，都会写 `ro.adb.secure=0` + `service.adb.tcp.port=5555`，直接把本项目的认证层绕过去，并且会让 5555 上同时存在一条明文通道。
+> 如果你装了 `adb_tcp5555` 或 `adbd_tcpip_unsec`（明文版），注意两点：它们的 `system.prop` 会写 `ro.adb.secure=0` + `service.adb.tcp.port=5555`，**每次开机都会把你的认证关掉**，需要靠本模块在 `late_start` 重新置 1（`FORCE_SECURE=1`）；而且它们占着 5555，所以 `ADB_TLS_PORT` 要改成 `5556`，否则模块会因端口冲突拒绝启动。
 
 装完点模块卡片的「操作」按钮，可以看到实际端口、转发状态和认证状态：
 
@@ -317,6 +353,11 @@ INFO: 已启动后台复核，间隔 60s
 | `ENSURE_WIFI_DEBUG` | `0` | 取不到 TLS 端口时是否自动打开系统「无线调试」开关 |
 | `KEYS_AUTO_INSTALL` | `1` | 是否自动把 `KEYS_DIR` 里的公钥合并进 `adb_keys`（`0` 关闭，只用 `adb pair`） |
 | `KEYS_DIR` | `/data/adb/adb_tls5555/keys` | 待授权公钥目录；读 `*.pub` 与 `keys.txt` |
+| `FORCE_SECURE` | `0` | 是否把 `ro.adb.secure` 置 1。`0`=只加密不认证（调试用）；`1`=客户端公钥必须在 `adb_keys` 里 |
+
+> **`ADB_TLS_PORT` 不能填 `service.adb.tcp.port` 正在用的端口。** 那种情况下 NAT REDIRECT 会把别人的明文通道顶掉，模块检测到冲突会拒绝启动。装了 `adbd_tcpip_unsec` 这类明文模块的设备，请填 `5556`。
+>
+> **`FORCE_SECURE=1` 会让所有通道（含明文端口和 USB）都要求公钥。** 开启前务必确认控制端公钥已在 `/data/misc/adb/adb_keys` 里，否则会把自己也锁在外面。回退方式：改回 `0` 后重启。
 
 三种模式怎么选：
 
@@ -337,10 +378,10 @@ INFO: 已启动后台复核，间隔 60s
 | 通道 | TLS 1.3（adbd 内置），端到端，NAT 不解密 |
 | 身份 | 客户端证书公钥必须在 `/data/misc/adb/adb_keys`，逐条 `EVP_PKEY_cmp` 比对 |
 | 抗扫描 | 没有正确私钥的握手在 TLS 阶段就被丢弃，`adbd` 不会执行任何 ADB 命令 |
-| 明文通道 | 启动时清除 + 后台复核，发现回潮即关 |
-| 认证强制 | `ro.adb.secure=1` 写死在 `system.prop`，不会因 `ro.secure=0` 而被绕过 |
+| 明文通道 | **v1.3.0 起不再清除**，改为保留作应急退路；它同样受 `FORCE_SECURE=1` 的公钥校验约束 |
+| 认证强制 | `FORCE_SECURE=1` 时在 `late_start` 置 `ro.adb.secure=1` 并重启 adbd，不会因 `ro.secure=0` 而被绕过 |
 | 暴露面 | `GUARD_MODE` 控制对外端口的来源；`all` 时依赖 TLS |
-| 失败行为 | fail-closed，不回落明文 |
+| 失败行为 | 模块自己失败时回滚属性并自我禁用，绝不把设备留在半截状态 |
 | 撤销 | 编辑 `/data/misc/adb/adb_keys` 删掉对应行，重启 adbd（或 `adb shell su -c 'setprop ctl.restart adbd'`） |
 
 ### 已知的残留暴露面
@@ -512,6 +553,7 @@ bash tools/grant_key.sh her.pub
 
 | 版本 | 内容 |
 |---|---|
+| **v1.3.0** | **删除 `system.prop`**：实测运行时 `setprop` 即可拉起 TLS 且与明文通道共存，模块从此在 `post-fs-data` 阶段零操作、不可能阻止开机；新增 `watchdog.sh` 独立看门狗、`.failcount` 电路熔断、端口冲突拒绝启动、`FORCE_SECURE` 开关；`uninstall.sh` 不再误清 `service.adb.tcp.port` |
 | **v1.2.2** | 修致命缺陷：后台复核发现 `service.adb.tls.port` 消失时会重新置位 `persist.adb.tls_server.enable` 并重启 adbd 自愈（带退避），不再永久失联 |
 | **v1.2.1** | 修 `adb_keys` 属主问题（不再无条件 `chown shell:shell`，否则 `AdbDebuggingManager` 失去写权限）；安装提示同时检出 `adbd_tcpip_unsec` |
 | **v1.2.0** | 补上认证层：客户端公钥预置（`keys/` → `adb_keys`），`action.sh` 增加认证段，`system.prop` 显式 `ro.adb.secure=1` + `ro.secure=0` |
