@@ -1,10 +1,14 @@
 # Magisk-ADB-TLS
 
+**当前版本 v1.2.1** ｜ [Releases](https://github.com/qzrsa/Magisk-ADB-TLS/releases)
+
 Magisk 模块：**开机确保 `adbd` 以 TLS 模式监听，并把固定的 `5555` 端口转发到它的实际端口，同时关闭明文 TCP 通道。**
 
-认证走 `adbd` 的 **TLS 客户端证书校验**：把控制端的 `adbkey.pub` 放进指定目录即可，不需要 6 位配对码，也不需要同一局域网。模块本身**不含任何密码逻辑**，也不加任何二进制。
+认证走 `adbd` 的 **TLS 客户端证书校验**：把控制端的 `adbkey.pub` 放进 `/data/adb/adb_tls5555/keys/` 即可，不需要 6 位配对码，也不需要同一局域网。模块本身**不含任何密码逻辑**，也不加任何二进制。
 
 > 本项目是 [Magisk-ADB-TCP-5555](https://github.com/qzrsa/Magisk-ADB-TCP-5555) 的安全向变体。那个模块解决"开机即用"，本项目解决"开机即用 **且** 可以放到公网"。
+
+**最常翻的三节：** [路径速查](#路径速查) ｜ [认证：让控制端进来](#认证让控制端进来) ｜ [排错](#排错)
 
 ---
 
@@ -24,9 +28,9 @@ Magisk 模块：**开机确保 `adbd` 以 TLS 模式监听，并把固定的 `55
 
 ---
 
-## 两个必须知道的事实
+## 三个必须知道的事实
 
-这两条是读 AOSP 源码核对的，也是本项目全部设计的依据。
+这三条是读 AOSP 源码核对的，也是本项目全部设计的依据。
 
 ### 一、`service.adb.tls.port` 是 adbd 的**输出**，不是输入
 
@@ -93,12 +97,12 @@ Magisk 模块：**开机确保 `adbd` 以 TLS 模式监听，并把固定的 `55
 3. **重启手机**
 4. 首次安装会生成配置：`/data/adb/adb_tls5555.conf`
 
-> 如果你装了 `adb_tcp5555`（明文版），**先卸载它**。
+> 如果你装了 `adb_tcp5555` 或 `adbd_tcpip_unsec`（明文版），**先卸载它们**。这两个模块的 `system.prop` 逐行相同，都会写 `ro.adb.secure=0` + `service.adb.tcp.port=5555`，直接把本项目的认证层绕过去，并且会让 5555 上同时存在一条明文通道。
 
 装完点模块卡片的「操作」按钮，可以看到实际端口、转发状态和认证状态：
 
 ```
---- adb_tls5555 v1.2.0 ---
+--- adb_tls5555 v1.2.1 ---
 --- 属性 ---
 service.adb.tls.port          = 39073
 service.adb.tcp.port          =
@@ -118,27 +122,72 @@ keystore /data/misc/adb/adb_keys = 1 条
 
 ---
 
+## 路径速查
+
+所有跟密钥有关的路径只有下面几个，其余都是中转。
+
+| 路径 | 作用 | 权限 | 谁写 |
+|---|---|---|---|
+| 控制端 `~/.android/adbkey.pub`<br>Windows `%USERPROFILE%\.android\adbkey.pub` | 客户端的**公钥**：700 字符 base64 + 一个空格 + 备注 | 普通用户 | `adb` 首次运行时自动生成 |
+| 控制端 `~/.android/adbkey`<br>Windows `%USERPROFILE%\.android\adbkey` | 客户端的**私钥**（PEM / PKCS#8）。**不要外传** | 普通用户 | 同上 |
+| `/data/adb/adb_tls5555/keys/`<br>读 `*.pub` 与 `keys.txt` | 待授权公钥的**投放目录** | `0700`，仅 root | 你 |
+| `/data/misc/adb/adb_keys` | **adbd 真正读的 keystore**，一行一个公钥。所谓"授权"就是往这里追加一行 | `0640`，实测 `system:shell`，SELinux `u:object_r:adb_keys_file:s0` | 模块 / 系统 / `tools/grant_key.sh` |
+
+流转关系：
+
+```
+你放进 /data/adb/adb_tls5555/keys/ 的 *.pub
+        │  模块开机时、或点「操作」时合并（按公钥本体去重，不覆盖已有条目）
+        ▼
+/data/misc/adb/adb_keys          ← adbd 只在启动时整份读进内存
+        │  所以改完必须重启 adbd
+        ▼
+adbd 拿客户端证书的公钥逐条比对这一份
+```
+
+两个容易踩的点：
+
+- **不要**把密钥放进 `/data/adb/modules/adb_tls5555/`。那是模块目录，升级或重装会被整个替换，密钥随之丢失。
+- `adb_keys` 只改权限位，**不要 `chown`**。各 ROM 属主不同（实测三星 OneUI 是 `system:shell`），强改成 `shell:shell` 会让以 `system` 身份运行的 `AdbDebuggingManager` 失去写权限——表现是 USB 授权弹窗点了「允许」也不落盘（v1.2.0 的 bug，v1.2.1 已修）。
+
+---
+
 ## 认证：让控制端进来
 
 `adbd` 只认一件事：**客户端的 TLS 证书公钥，是否出现在 `/data/misc/adb/adb_keys` 里**。让某个公钥出现在那里，有两条路。
 
 ### 方式一：预置公钥（推荐，不需要配对码）
 
-模块会读 `/data/adb/adb_tls5555/keys/` 下的 `*.pub` 和 `keys.txt`，把里面的公钥合并进 `adb_keys`，然后自动重启 adbd 生效。
+先记住一条：**网络 ADB 不会弹「允许调试吗」的对话框。** 那个弹窗只在插 USB 时出现。没授权的客户端连上来会直接失败，手机上没有任何提示，所以只能靠预置公钥。顺序必须是「先授权，再连」。
+
+#### 最省事：跑一次 `tools/grant_key.sh`
+
+```bash
+ADB_SERIAL=10.126.126.111:5555 bash tools/grant_key.sh her.pub
+```
+
+它做四件事：
+
+1. 归一化输入（去掉 `\r`、只取第一条有效公钥行、校验 base64 长度）
+2. 幂等检查——公钥已在列表里就直接退出，不重复写
+3. 追加进 `/data/misc/adb/adb_keys`，补尾换行、`chmod 0640`、`restorecon`
+4. 重启 adbd 并重连校验（USB 会自动回来，网络连接会走 `adb connect` 重试）
+
+**内置防呆**：若当前是网络连接（序列号形如 `IP:端口`）而 `service.adb.tcp.port` 为空，脚本**不会**重启 adbd——那种情况下重启会关掉 TCP 监听且不再恢复，设备直接失联。它只写文件，然后提示「重启手机后自动生效」。
+
+#### 手动四步
 
 **第 1 步：拿到控制端的公钥**
 
 ```bash
-# 路径（第一次运行 adb 时自动生成，已存在就不要动它）
-#   Windows:    %USERPROFILE%\.android\adbkey.pub
+# 第一次运行 adb 时自动生成，已存在就不要动它
+#   Windows:     %USERPROFILE%\.android\adbkey.pub
 #   macOS/Linux: ~/.android/adbkey.pub
 cat ~/.android/adbkey.pub
 # 输出形如：AAAA...（700 字符 base64） user@host
 ```
 
-**第 2 步：放进手机的公钥目录**
-
-任选一种：
+**第 2 步：放进手机的公钥目录** `/data/adb/adb_tls5555/keys/`，任选一种：
 
 ```bash
 # A. 你已经能用 USB adb 连上手机（最简单）
@@ -402,6 +451,44 @@ python tools/build.py --out dist
 ```
 
 脚本会：统一换行符为 LF 并剥掉 BOM → 把模块必需文件平铺打进 zip 根目录 → 给 `.sh` 显式写入 `0755` → 校验 CRC、根目录结构和权限位。
+
+## 配套工具
+
+`tools/grant_key.sh` —— 在电脑上把一个客户端公钥授权到被控机，不打包进 zip。
+
+```bash
+# 单个公钥文件
+ADB_SERIAL=10.126.126.111:5555 bash tools/grant_key.sh her.pub
+
+# 从剪贴板/管道来
+cat her.pub | ADB_SERIAL=10.126.126.111:5555 bash tools/grant_key.sh -
+
+# 只有一台设备时可以省略 ADB_SERIAL
+bash tools/grant_key.sh her.pub
+```
+
+行为要点：
+
+| 场景 | 结果 |
+|---|---|
+| 公钥已在 `adb_keys` | 输出「已在授权列表里」，不做任何修改 |
+| 公钥是新的 | 追加一行 + `chmod 0640` + `restorecon`，然后重启 adbd 并重连校验 |
+| 网络连接 + `service.adb.tcp.port` 为空 | **只写不重启**（重启会让设备失联），提示重启手机后生效 |
+| 被控机没有 root | 明确报错退出，不会留下半截状态 |
+
+已实测四条路径：新增、幂等、防呆、残留清理。测试用临时 keystore 副本，不碰真实文件。
+
+---
+
+## 变更记录
+
+| 版本 | 内容 |
+|---|---|
+| **v1.2.1** | 修 `adb_keys` 属主问题（不再无条件 `chown shell:shell`，否则 `AdbDebuggingManager` 失去写权限）；安装提示同时检出 `adbd_tcpip_unsec` |
+| **v1.2.0** | 补上认证层：客户端公钥预置（`keys/` → `adb_keys`），`action.sh` 增加认证段，`system.prop` 显式 `ro.adb.secure=1` + `ro.secure=0` |
+| v1.1.1 | REDIRECT 直写 `PREROUTING`，修 nft 后端下「跳转规则建成功、链里是空的」 |
+| v1.1.0 | 改走 NAT 转发，修 `service.adb.tls.port` 被 adbd 随机覆盖的问题 |
+| v1.0.0 | 首版，尝试直接注入 `service.adb.tls.port`（无效，见上文） |
 
 ---
 
