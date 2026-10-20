@@ -1,6 +1,6 @@
 id=adb_tls5555
 name=ADB TLS 5555 开机自启
-version=1.1.0
-versionCode=2
+version=1.1.1
+versionCode=3
 author=QZRS
 description=开机确保 adbd 以 TLS 模式监听，并把固定的 5555 端口用内核 NAT 转发到它的随机端口，同时关闭明文 TCP 通道。认证由 adbd 内置的 TLS 配对完成（adb pair 一次，长期有效），模块不含任何密码逻辑。

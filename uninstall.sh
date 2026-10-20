@@ -22,7 +22,29 @@ if [ -f "$CONF" ]; then
     esac
 fi
 
-# 拆 NAT（逐条删，防止 netd 插队导致漏删）
+# 拆 NAT
+# 1) 按 stamp 里记录的实际端口删 REDIRECT 规则（端口是 adbd 随机选的，不能猜）
+STAMP="$MODDIR/.tls_port"
+if [ -f "$STAMP" ]; then
+    _int=$(tr -d '[:space:]' < "$STAMP")
+    case "$_int" in
+        ''|*[!0-9]*) ;;
+        *)
+            _i=0
+            while [ "$_i" -lt 4 ]; do
+                iptables -t nat -D PREROUTING -p tcp --dport "$PORT" -j REDIRECT --to-ports "$_int" 2>/dev/null || break
+                _i=$((_i + 1))
+            done
+            _i=0
+            while [ "$_i" -lt 4 ]; do
+                ip6tables -t nat -D PREROUTING -p tcp --dport "$PORT" -j REDIRECT --to-ports "$_int" 2>/dev/null || break
+                _i=$((_i + 1))
+            done
+            ;;
+    esac
+fi
+
+# 2) 清掉 v1.1.0 遗留的中间链
 _i=0
 while [ "$_i" -lt 4 ]; do
     iptables -t nat -D PREROUTING -p tcp --dport "$PORT" -j ADB_TLS_NAT 2>/dev/null || break

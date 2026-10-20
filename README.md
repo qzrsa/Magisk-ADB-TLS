@@ -41,10 +41,11 @@ Magisk 模块：**开机确保 `adbd` 以 TLS 模式监听，并把固定的 `55
 1. persist.adb.tls_server.enable=1        ← 唯一的真实输入，system.prop 注入
 2. 等 adbd 起来，读 service.adb.tls.port  ← 比如 39073
 3. NAT 把固定的 5555 转发到它：
-     iptables -t nat -I PREROUTING 1 -p tcp --dport 5555 -j ADB_TLS_NAT
-     iptables -t nat -A ADB_TLS_NAT -j REDIRECT --to-ports 39073
+     iptables -t nat -A PREROUTING -p tcp --dport 5555 -j REDIRECT --to-ports 39073
 4. 后台复核端口变化，变了就重建规则
 ```
+
+> REDIRECT 必须**直接写在 PREROUTING**。Android 的 iptables 走 nft 后端，把 NAT 目标放进用户自定义链会被拒绝，表现为「跳转规则建成功、链里是空的」——看着有规则，流量却不转发。v1.1.1 已改为直写。
 
 **TLS 仍然是端到端的**：NAT 只改目的端口号，不接触内容，所以客户端依然和 adbd 直接完成 TLS 握手，中间没有任何解密环节，也不需要额外进程。
 
@@ -63,7 +64,7 @@ Magisk 模块：**开机确保 `adbd` 以 TLS 模式监听，并把固定的 `55
 
 > 如果你装了 `adb_tcp5555`（明文版），**先卸载它**。
 
-装完点模块卡片的「操作」按钮，可以看到实际端口与 NAT 状态：
+装完点模块卡片的「操作」按钮，可以看到实际端口与转发状态：
 
 ```
 --- adb_tls5555 ---
@@ -72,8 +73,8 @@ service.adb.tcp.port          =
 persist.adb.tls_server.enable = 1
 对外端口 ADB_TLS_PORT         = 5555（NAT 转发到上面的实际端口）
 --- nat ---
--A PREROUTING -p tcp -m tcp --dport 5555 -j ADB_TLS_NAT
--A ADB_TLS_NAT -j REDIRECT --to-ports 39073
+-A PREROUTING -p tcp -m tcp --dport 5555 -j REDIRECT --to-ports 39073
+转发状态: 就绪（5555 → 39073）
 ```
 
 ---
@@ -124,7 +125,7 @@ adb connect <手机IP>:5555
 
 ```bash
 su -c 'cat /data/adb/modules/adb_tls5555/adb_tls.log'
-su -c 'iptables -t nat -S ADB_TLS_NAT'
+su -c 'iptables -t nat -S PREROUTING | grep 5555'
 ```
 
 正常日志：
@@ -133,7 +134,7 @@ su -c 'iptables -t nat -S ADB_TLS_NAT'
 ===== service.sh 启动 =====
 conf: port=5555 mode=all ...
 INFO: adbd TLS 端口 = 39073
-INFO: TLS 端口 无 → 39073，NAT 已重建（外部 5555）
+INFO: TLS 端口 无 → 39073，已重建转发（外部 5555）
 OK: 5555 → 39073 转发就绪
 guard: mode=all（不做来源限制，安全性依赖 TLS 认证）
 INFO: 已启动后台复核，间隔 60s
@@ -216,11 +217,26 @@ iptables -A INPUT -p tcp --dport 39073 -j DROP
 
 | 现象 | 排查 |
 |---|---|
-| `Connection refused` | 对外端口无人转发 → 看日志有没有 `OK: ... 转发就绪`；查 `iptables -t nat -S ADB_TLS_NAT` |
+| `Connection refused` | 对外端口无人转发 → 点「操作」看「转发状态」，查 `iptables -t nat -S PREROUTING \| grep 5555` |
 | `failed to authenticate` | 没配对过，或清了 `/data/misc/adb/` → 重新 `adb pair` |
 | `adb connect` 卡住 | adb 版本 < 30，不支持 TLS 客户端 |
 | 配对成功但连不上 | 确认连的是 `5555`（对外端口），不是配对端口 |
 | 端口一会儿通一会儿不通 | adbd 的随机端口变了而复核还没跟上 → 调小 `VERIFY_INTERVAL`，或点「操作」立即重建 |
+
+### 「转发状态: 未就绪」
+
+先看 `iptables -t nat -S PREROUTING` 里有没有这一行：
+
+```
+-A PREROUTING -p tcp -m tcp --dport 5555 -j REDIRECT --to-ports <实际端口>
+```
+
+- **没有** → 规则没建上。日志里会有 `WARN: v4 REDIRECT 添加失败: <iptables 原话>`，按那句话判断（多半是 nat 表被 netd 锁住或内核没编 nat）。
+- **有，但连不上** → 转发是好的，问题在 adbd 侧。先用 `nc -z 127.0.0.1 <实际端口>` 在手机上确认 adbd 那个端口能连，再确认它接受 IPv4（netstat 显示 `:::端口` 时通常双栈，若只接受 IPv6 则 IPv4 转发进不去）。
+
+### 官方 ROM 上 REDIRECT 报错
+
+Android 的 iptables 走 nft 后端，**NAT 目标不能放在用户自定义链里**。这就是 v1.1.0 失败的原因：跳转规则建成功、链是空的，看着有规则却不转发。v1.1.1 起直接把 REDIRECT 写进 `PREROUTING`，不再用中间链。
 
 ### 控制端是自研 App
 

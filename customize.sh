@@ -7,7 +7,7 @@
 
 ui_print " "
 ui_print "*******************************"
-ui_print "  ADB TLS 5555 开机自启  v1.1.0"
+ui_print "  ADB TLS 5555 开机自启  v1.1.1"
 ui_print "*******************************"
 ui_print "  - adbd 以 TLS 模式监听"
 ui_print "  - adbd 的端口由系统随机分配，"

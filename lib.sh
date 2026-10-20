@@ -118,62 +118,103 @@ iptn() { iptables $IPT_W -t nat "$@"; }
 ip6n() { ip6tables $IPT_W -t nat "$@"; }
 
 # ---- NAT：固定端口 → adbd 实际端口 --------------------------------------
+#
+# REDIRECT 必须**直接写在 PREROUTING 里**。
+# Android 的 iptables 走 nft 后端，NAT 目标放进用户自定义链会被拒绝，
+# 表现为「跳转规则建成功、链里是空的」——看起来有规则，流量却不转发。
+#
 
-flush_nat() {
-    iptn -D PREROUTING -p tcp --dport "$PORT" -j ADB_TLS_NAT 2>/dev/null
+# 清掉 v1.1.0 遗留的 ADB_TLS_NAT / ADB_TLS_NAT6 空链与跳转
+flush_nat_legacy() {
+    _i=0
+    while [ "$_i" -lt 3 ]; do
+        iptn -D PREROUTING -p tcp --dport "$PORT" -j ADB_TLS_NAT 2>/dev/null || break
+        _i=$((_i + 1))
+    done
     iptn -F ADB_TLS_NAT 2>/dev/null
     iptn -X ADB_TLS_NAT 2>/dev/null
-    ip6n -D PREROUTING -p tcp --dport "$PORT" -j ADB_TLS_NAT6 2>/dev/null
+
+    _i=0
+    while [ "$_i" -lt 3 ]; do
+        ip6n -D PREROUTING -p tcp --dport "$PORT" -j ADB_TLS_NAT6 2>/dev/null || break
+        _i=$((_i + 1))
+    done
     ip6n -F ADB_TLS_NAT6 2>/dev/null
     ip6n -X ADB_TLS_NAT6 2>/dev/null
 }
 
+# 添加失败时把 iptables 的原话记进日志，不再静默吞掉
+nat_add() {
+    _fam=$1
+    _p=$2
+    if [ "$_fam" = "v4" ]; then
+        _e=$(iptn -A PREROUTING -p tcp --dport "$PORT" -j REDIRECT --to-ports "$_p" 2>&1 >/dev/null)
+    else
+        command -v ip6tables >/dev/null 2>&1 || return 0
+        _e=$(ip6n -A PREROUTING -p tcp --dport "$PORT" -j REDIRECT --to-ports "$_p" 2>&1 >/dev/null)
+    fi
+    [ -n "$_e" ] && log "WARN: $_fam REDIRECT 添加失败: $_e"
+    return 0
+}
+
+nat_del() {
+    _fam=$1
+    _p=$2
+    if [ "$_fam" = "v4" ]; then
+        iptn -D PREROUTING -p tcp --dport "$PORT" -j REDIRECT --to-ports "$_p" 2>/dev/null
+    else
+        command -v ip6tables >/dev/null 2>&1 || return 0
+        ip6n -D PREROUTING -p tcp --dport "$PORT" -j REDIRECT --to-ports "$_p" 2>/dev/null
+    fi
+}
+
 apply_nat() {
     _int=$1
-    flush_nat
+    _prev=$(cat "$STAMP" 2>/dev/null)
 
-    # adbd 恰好挑中同一个端口时不需要转发，但仍记录，避免复核时反复重建
+    flush_nat_legacy
+
+    # 端口变了：先删旧端口对应的规则
+    if [ -n "$_prev" ] && [ "$_prev" != "$_int" ]; then
+        nat_del v4 "$_prev"
+        nat_del v6 "$_prev"
+    fi
+
+    # adbd 恰好挑中同一个端口：无需转发，但仍记录，避免复核反复重建
     if [ "$_int" = "$PORT" ]; then
         printf '%s' "$_int" > "$STAMP"
         return 0
     fi
 
-    iptn -N ADB_TLS_NAT 2>/dev/null
-    iptn -A ADB_TLS_NAT -j REDIRECT --to-ports "$_int" 2>/dev/null
-    iptn -I PREROUTING 1 -p tcp --dport "$PORT" -j ADB_TLS_NAT 2>/dev/null
-
-    if command -v ip6tables >/dev/null 2>&1; then
-        ip6n -N ADB_TLS_NAT6 2>/dev/null
-        ip6n -A ADB_TLS_NAT6 -j REDIRECT --to-ports "$_int" 2>/dev/null
-        ip6n -I PREROUTING 1 -p tcp --dport "$PORT" -j ADB_TLS_NAT6 2>/dev/null
-    fi
+    # 幂等：同规格先删后加
+    nat_del v4 "$_int"
+    nat_del v6 "$_int"
+    nat_add v4 "$_int"
+    nat_add v6 "$_int"
 
     printf '%s' "$_int" > "$STAMP"
 }
 
-# 端口变化时重建 NAT，并把新端口记进 stamp。service.sh 与 action.sh 共用。
+# 端口变化时重建转发，并把新端口记进 stamp。service.sh 与 action.sh 共用。
 follow_tls_port() {
     _p=$1
-    _old=$(cat "$STAMP" 2>/dev/null)
+    _was=$(cat "$STAMP" 2>/dev/null)
     apply_nat "$_p"
-    if [ "$_p" != "$_old" ]; then
-        log "INFO: TLS 端口 ${_old:-无} → $_p，NAT 已重建（外部 $PORT）"
+    if [ "$_p" != "$_was" ]; then
+        log "INFO: TLS 端口 ${_was:-无} → $_p，已重建转发（外部 $PORT）"
     fi
     if nat_ok "$_p"; then
         log "OK: $PORT → $_p 转发就绪"
     else
-        log "FAIL: NAT 规则未生效（$PORT → $_p）"
+        log "FAIL: 转发规则未生效（$PORT → $_p），见 README「排错」"
     fi
 }
 
 nat_ok() {
     _int=$1
+    [ -z "$_int" ] && return 1
     [ "$_int" = "$PORT" ] && return 0
-    iptn -C PREROUTING -p tcp --dport "$PORT" -j ADB_TLS_NAT 2>/dev/null || return 1
-    iptn -S ADB_TLS_NAT 2>/dev/null | grep -q -- "--to-ports $_int" || return 1
-    if command -v ip6tables >/dev/null 2>&1; then
-        ip6n -C PREROUTING -p tcp --dport "$PORT" -j ADB_TLS_NAT6 2>/dev/null || return 1
-    fi
+    iptn -C PREROUTING -p tcp --dport "$PORT" -j REDIRECT --to-ports "$_int" 2>/dev/null || return 1
     return 0
 }
 

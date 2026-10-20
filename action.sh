@@ -45,8 +45,17 @@ echo "GUARD_MODE                    = $MODE"
 
 if [ "$IPT_OK" = "1" ]; then
     echo "--- nat ---"
-    iptn -S PREROUTING 2>/dev/null | grep -i "ADB_TLS_NAT" || echo "(无 NAT 规则)"
-    iptn -S ADB_TLS_NAT 2>/dev/null | grep -- "--to-ports" || true
+    _rules=$(iptn -S PREROUTING 2>/dev/null | grep -iE "REDIRECT|ADB_TLS_NAT")
+    if [ -n "$_rules" ]; then
+        echo "$_rules"
+    else
+        echo "(无转发规则)"
+    fi
+    if nat_ok "${_int:-}"; then
+        echo "转发状态: 就绪（$PORT → ${_int:-?}）"
+    else
+        echo "转发状态: 未就绪"
+    fi
     if [ "$MODE" != "all" ]; then
         echo "--- filter ---"
         ipt -S ADB_GUARD 2>/dev/null || echo "(无防火墙链)"
