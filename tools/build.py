@@ -27,6 +27,7 @@ MODULE_FILES = [
     "module.prop",
     "system.prop",
     "module.conf",
+    "lib.sh",
     "service.sh",
     "action.sh",
     "uninstall.sh",

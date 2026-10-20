@@ -1,12 +1,12 @@
 #!/system/bin/sh
 #
 # adb_tls5555 / uninstall.sh
-# 卸载：拆掉防火墙链、清掉 TLS 属性、重启 adbd 回纯 USB 模式。
+# 卸载：拆掉 NAT 转发与防火墙链、清掉 TLS 属性、重启 adbd 回纯 USB 模式。
 #
 # 注意：
-#   * INPUT 里的跳转规则带 --dport，必须按同一个 dport 删，否则删不掉；
-#     端口从用户配置里读，读不到就按 5555 处理。
-#   * persist.adb.tls_server.enable 是持久属性，优先用 resetprop --delete 删掉。
+#   * NAT / INPUT 的跳转规则都带 --dport，必须按同一端口删；
+#     端口从用户配置读，读不到按 5555 处理。
+#   * persist.adb.tls_server.enable 是持久属性，优先用 resetprop --delete 删除。
 #
 
 MODDIR=${0%/*}
@@ -22,7 +22,24 @@ if [ -f "$CONF" ]; then
     esac
 fi
 
-# 拆防火墙（逐条删，防止 netd 插队导致漏删）
+# 拆 NAT（逐条删，防止 netd 插队导致漏删）
+_i=0
+while [ "$_i" -lt 4 ]; do
+    iptables -t nat -D PREROUTING -p tcp --dport "$PORT" -j ADB_TLS_NAT 2>/dev/null || break
+    _i=$((_i + 1))
+done
+iptables -t nat -F ADB_TLS_NAT 2>/dev/null
+iptables -t nat -X ADB_TLS_NAT 2>/dev/null
+
+_i=0
+while [ "$_i" -lt 4 ]; do
+    ip6tables -t nat -D PREROUTING -p tcp --dport "$PORT" -j ADB_TLS_NAT6 2>/dev/null || break
+    _i=$((_i + 1))
+done
+ip6tables -t nat -F ADB_TLS_NAT6 2>/dev/null
+ip6tables -t nat -X ADB_TLS_NAT6 2>/dev/null
+
+# 拆防火墙
 _i=0
 while [ "$_i" -lt 4 ]; do
     iptables -D INPUT -p tcp --dport "$PORT" -j ADB_GUARD 2>/dev/null || break
@@ -50,7 +67,7 @@ setprop ctl.restart adbd 2>/dev/null || {
     start adbd 2>/dev/null
 }
 
-rm -f "$MODDIR/adb_tls.log" 2>/dev/null
+rm -f "$MODDIR/adb_tls.log" "$MODDIR/.tls_port" 2>/dev/null
 
-echo "adb_tls5555 已移除：adbd 已回 USB 模式"
+echo "adb_tls5555 已移除：NAT 与防火墙已拆除，adbd 已回 USB 模式"
 echo "配置保留在 $CONF，如需彻底清理可手动删除"
