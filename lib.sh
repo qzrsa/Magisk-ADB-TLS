@@ -96,6 +96,40 @@ wait_tls_port() {
     return 1
 }
 
+# 让 adbd 重新带回 TLS 监听。返回 0 = 已恢复且转发已建好。
+#
+# 为什么需要这个函数：
+#   service.adb.tls.port 变空的真实含义是「adbd 根本没有 TLS 监听」，
+#   此时 5555 上是空的，连接直接被 RST（Connection refused）。成因通常是
+#   persist.adb.tls_server.enable 被清掉，或系统把「无线调试」关掉后 adbd
+#   的 TlsServer 停止。adbd 自己不会再把端口要回来，只能外部干预：
+#   把开关属性重新置 1，再重启 adbd。
+#
+#   注意：能走到这里说明远程**已经连不上了**，所以重启 adbd 不会有损失。
+#   反过来，端口正常时绝不能重启 —— 那会主动踢掉正在连的客户端。
+ensure_tls_alive() {
+    if [ "$(getprop persist.adb.tls_server.enable)" != "1" ]; then
+        log "INFO: persist.adb.tls_server.enable 缺失，重新置 1"
+        setprop persist.adb.tls_server.enable 1
+    fi
+
+    restart_adbd
+
+    _p=$(wait_tls_port 20)
+    if [ -z "$_p" ] && [ "$ENSURE" = "1" ]; then
+        log "WARN: 仍无 TLS 端口，尝试打开「无线调试」设置开关"
+        settings put global adb_wifi_enabled 1 2>/dev/null
+        sleep 3
+        _p=$(wait_tls_port 20)
+    fi
+
+    [ -z "$_p" ] && return 1
+
+    log "INFO: adbd 已重新提供 TLS 端口 $_p"
+    follow_tls_port "$_p"
+    return 0
+}
+
 # ---- iptables 兼容层 ----------------------------------------------------
 # 锁等待参数不是所有 Android 版本都支持「-w 秒数」，逐级降级，
 # 避免命令整体报错导致规则静默失效。

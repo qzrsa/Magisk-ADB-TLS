@@ -9,7 +9,8 @@
 #     0. 把 KEYS_DIR 里的客户端公钥合并进 adbd 的 keystore（认证层）
 #     1. 清掉明文通道（service.adb.tcp.port），避免两条通道并存
 #     2. 读 adbd 实际分配的 TLS 端口，用 NAT REDIRECT 把固定端口转发过去
-#     3. 防火墙来源控制 + 后台低频复核（端口变化、明文回潮、规则丢失、新公钥）
+#     3. 防火墙来源控制 + 后台低频复核（端口变化、端口消失自愈、
+#        明文回潮、规则丢失、新公钥）
 #
 # 设计原则：fail-closed。
 # 拿不到 TLS 端口时不回落到明文 5555 —— 宁可连不上，也不要静默降级。
@@ -19,6 +20,9 @@ MODDIR=${0%/*}
 . "$MODDIR/lib.sh"
 
 verify_loop() {
+    _miss=0    # 连续「没有 TLS 端口」的轮数
+    _fix=0     # 连续自愈尝试次数，用于退避
+
     while true; do
         sleep "$INTERVAL"
         [ -d "$MODDIR" ] || exit 0
@@ -40,13 +44,42 @@ verify_loop() {
 
         _p=$(getprop service.adb.tls.port)
         if valid_port "$_p"; then
+            _miss=0
+            _fix=0
             if [ "$_p" != "$(cat "$STAMP" 2>/dev/null)" ] || ! nat_ok "$_p"; then
                 follow_tls_port "$_p"
             fi
         else
-            # 端口消失通常是「无线调试」被关掉，adbd 的 TLS 服务随之停止。
-            # 这时 5555 上没有服务可转发，保持现状即可（fail-closed）。
+            # 端口消失 = adbd 已经没有 TLS 监听 = 远程此刻连不上。
+            # v1.2.1 及以前这里直接放弃（只删 stamp），结果是「无线调试」被
+            # 系统关掉一次就永久失联，只能 USB 或重启才能救回来 ——
+            # 对一个「部署在公网」的模块来说这是致命缺陷。
             rm -f "$STAMP"
+            _miss=$((_miss + 1))
+
+            _due=0
+            if [ "$_fix" -lt 3 ]; then
+                # 连续 2 轮（≈2×INTERVAL）都拿不到才动手，避开自身重启 adbd
+                # 造成的瞬时空窗
+                [ "$_miss" -ge 2 ] && _due=1
+            else
+                # 连续 3 次都救不回来：退避到每 10 轮再试一次，别无限重启 adbd
+                if [ "$_miss" -ge 10 ]; then
+                    _due=1
+                fi
+            fi
+
+            if [ "$_due" = "1" ]; then
+                _miss=0
+                _fix=$((_fix + 1))
+                log "WARN: TLS 端口消失，自愈尝试第 $_fix 次"
+                if ensure_tls_alive; then
+                    log "OK: 自愈成功，转发已恢复"
+                    _fix=0
+                else
+                    log "FAIL: 自愈失败（第 $_fix 次），adbd 未提供 TLS 端口"
+                fi
+            fi
         fi
 
         if ! guard_ok; then

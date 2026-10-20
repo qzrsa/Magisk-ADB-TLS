@@ -1,6 +1,6 @@
 # Magisk-ADB-TLS
 
-**当前版本 v1.2.1** ｜ [Releases](https://github.com/qzrsa/Magisk-ADB-TLS/releases)
+**当前版本 v1.2.2** ｜ [Releases](https://github.com/qzrsa/Magisk-ADB-TLS/releases)
 
 Magisk 模块：**开机确保 `adbd` 以 TLS 模式监听，并把固定的 `5555` 端口转发到它的实际端口，同时关闭明文 TCP 通道。**
 
@@ -376,6 +376,34 @@ iptables -A INPUT -p tcp --dport 39073 -j DROP
 
 端口起来后，后台复核会在一个间隔内自动建好 NAT，不需要重启。
 
+### 彻底连不上：`Connection refused` + 两个端口属性都是空
+
+这是**最危险**的状态，也是 v1.2.1 的真实事故：`service.adb.tls.port` 和
+`service.adb.tcp.port` 同时为空，说明 adbd 只监听 USB，5555 上什么都没有，
+连接被内核直接 RST。
+
+判据（能 USB 进去或能在手机上执行时）：
+
+```sh
+getprop persist.adb.tls_server.enable   # 期望 1
+getprop service.adb.tls.port            # 期望一个随机端口
+getprop service.adb.tcp.port            # 期望空
+```
+
+`persist.adb.tls_server.enable` 为空就必然是这个状态——adbd 启动时没有
+TLS 能力开关，起来就是裸 adbd。
+
+**v1.2.2 起模块会自己救回来**：后台复核发现端口消失会在 2 个间隔内重新
+置位属性并重启 adbd，前 3 次每 2 个间隔一次，之后退避到每 10 个间隔一次。
+能自愈的前提是 **`service.sh` 还活着**——所以：
+
+- 只改配置、不重启手机 → 能自愈；
+- 手滑点了「无线调试」开关关掉 → 能自愈；
+- 模块被禁用 / 卸载 / 手机重启后模块没加载 → **不能自愈，必须 USB 或
+  物理重启**。
+
+所以公网部署的机器，**别在只有远程的情况下卸载或禁用模块**。
+
 ### 连接失败
 
 | 现象 | 排查 |
@@ -484,6 +512,7 @@ bash tools/grant_key.sh her.pub
 
 | 版本 | 内容 |
 |---|---|
+| **v1.2.2** | 修致命缺陷：后台复核发现 `service.adb.tls.port` 消失时会重新置位 `persist.adb.tls_server.enable` 并重启 adbd 自愈（带退避），不再永久失联 |
 | **v1.2.1** | 修 `adb_keys` 属主问题（不再无条件 `chown shell:shell`，否则 `AdbDebuggingManager` 失去写权限）；安装提示同时检出 `adbd_tcpip_unsec` |
 | **v1.2.0** | 补上认证层：客户端公钥预置（`keys/` → `adb_keys`），`action.sh` 增加认证段，`system.prop` 显式 `ro.adb.secure=1` + `ro.secure=0` |
 | v1.1.1 | REDIRECT 直写 `PREROUTING`，修 nft 后端下「跳转规则建成功、链里是空的」 |
