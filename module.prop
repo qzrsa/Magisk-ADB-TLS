@@ -1,0 +1,6 @@
+id=adb_tls5555
+name=ADB TLS 5555 开机自启
+version=1.0.0
+versionCode=1
+author=QZRS
+description=开机让 adbd 以 TLS 模式在固定端口监听，并关闭明文 TCP 通道。认证由 adbd 内置的 TLS 配对完成（adb pair 一次，长期有效），模块本身不含任何密码逻辑。附设备侧防火墙白名单。

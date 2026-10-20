@@ -1,0 +1,15 @@
+# 构建产物（zip 走 GitHub Release，不进仓库）
+*.zip
+dist/
+_out/
+
+# 编辑器 / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# 系统垃圾
+Thumbs.db
+desktop.ini
+.DS_Store
