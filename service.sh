@@ -1,6 +1,6 @@
 #!/system/bin/sh
 #
-# adb_tls5555 / service.sh   v1.3.0
+# adb_tls5555 / service.sh   v1.3.1
 #
 # ⚠ 本版本**没有 system.prop**，一行都没有。这是刻意的：
 #
@@ -44,6 +44,10 @@ verify_loop() {
             exit 0
         fi
 
+        # keystore 自愈：框架会在每次认证成功后重写 adb_keys，
+        # 把它不认识的公钥删掉。这里定期补回（不需要重启 adbd）。
+        ensure_keys
+
         _p=$(getprop service.adb.tls.port)
         if valid_port "$_p"; then
             if [ "$_p" != "$(cat "$STAMP" 2>/dev/null)" ] || ! nat_ok "$_p"; then
@@ -65,7 +69,7 @@ verify_loop() {
 }
 
 main() {
-    log "===== service.sh 启动 (v1.3.0) ====="
+    log "===== service.sh 启动 (v1.3.1) ====="
 
     # ---- 0. 电路熔断 ----------------------------------------------------
     # 上次运行失败过就不要再试。每次失败都白白消耗一次开机，

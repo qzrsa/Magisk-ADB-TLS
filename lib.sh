@@ -479,6 +479,36 @@ install_client_keys() {
     return 0
 }
 
+# ---- keystore 自愈 ------------------------------------------------------
+#
+# 安卓框架的 AdbDebuggingManager 在**每次有客户端认证成功**之后都会收到
+# MESSAGE_ADB_PERSIST_KEYSTORE，然后拿它自己内存里的那份 key map
+# 把 /data/misc/adb/adb_keys **整个重写一遍**。
+#
+# 它内存里只有「本次开机之后连过的」以及极少数历史条目，
+# 那些「一直没连过、但确实应该被授权」的公钥会在重写时被无声删掉。
+#
+# 真机实测（三星 SCG23，Android 14，2026-10-20）：
+#   19:35  adb_keys 有 6 条 / 4308 字节
+#   19:54  MESSAGE_ADB_PERSIST_KEYSTORE 触发后只剩 2 条 / 1434 字节
+#   被删的 4 条恰好是从没连接过的 Administrator@WIN-20251114JKM /
+#   VPhoneGaGaTitan / shizuku / 无界SystemApi
+#
+# 后果：一旦开了认证（ro.adb.secure=1），被删的客户端就永久进不来，
+# 而且没有任何报错 —— 表现就是「密钥不生效」。
+#
+# 所以运行期必须定期把 KEYS_DIR 里的公钥补回去。好消息是 adbd 在
+# **每次认证时都会重新读 adb_keys**（logcat: adbd_auth: loading keys from ...），
+# 所以补写之后不需要重启 adbd，也不会打断现有连接。
+ensure_keys() {
+    [ "$AUTO_KEY" = "1" ] || return 0
+    install_client_keys
+    [ "$?" = "0" ] || return 0
+
+    log "WARN: keystore 被系统框架改写，已补回缺失公钥（当前 $(keystore_count) 条，无需重启 adbd）"
+    return 0
+}
+
 # keystore 里已授权的客户端数量
 keystore_count() {
     if [ -f "$KEYSTORE" ]; then
