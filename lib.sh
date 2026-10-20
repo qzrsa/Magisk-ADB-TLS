@@ -360,15 +360,21 @@ install_client_keys() {
     log "INFO: 预置 $_n 个客户端公钥 → $KEYSTORE"
 
     mkdir -p /data/misc/adb 2>/dev/null
-    [ -f "$KEYSTORE" ] || : > "$KEYSTORE"
+    _created=0
+    [ -f "$KEYSTORE" ] || { : > "$KEYSTORE"; _created=1; }
 
     # 原文件最后一字节不是换行时先补一个，避免两条公钥黏在一行
     if [ -s "$KEYSTORE" ] && [ "$(tail -c 1 "$KEYSTORE" 2>/dev/null | wc -l)" = "0" ]; then
         echo >> "$KEYSTORE"
     fi
     printf '%s\n' "$_add" >> "$KEYSTORE"
-    # adbd 对这个文件的属主/权限/SELinux 标签有要求，缺一不可
-    chown shell:shell "$KEYSTORE" 2>/dev/null
+
+    # 只在「自己新建的文件」上设属主。
+    # 已有文件的属主各 ROM 不同（AOSP 常见 shell:shell，三星 OneUI 是
+    # system:shell）。强行改成 shell:shell 会让以 system 身份运行的
+    # AdbDebuggingManager 失去写权限 —— 表现为 USB 授权弹窗点了"允许"
+    # 也不生效。权限位与 SELinux 标签则可以安全地修正。
+    [ "$_created" = "1" ] && chown shell:shell "$KEYSTORE" 2>/dev/null
     chmod 0640 "$KEYSTORE" 2>/dev/null
     restorecon "$KEYSTORE" >/dev/null 2>&1 \
         || chcon u:object_r:adb_keys_file:s0 "$KEYSTORE" 2>/dev/null

@@ -9,7 +9,7 @@ KEYS_DIR=/data/adb/adb_tls5555/keys
 
 ui_print " "
 ui_print "*******************************"
-ui_print "  ADB TLS 5555 开机自启  v1.2.0"
+ui_print "  ADB TLS 5555 开机自启  v1.2.1"
 ui_print "*******************************"
 ui_print "  - adbd 以 TLS 模式监听"
 ui_print "  - adbd 的端口由系统随机分配，"
@@ -37,13 +37,17 @@ chmod 0700 "$KEYS_DIR" 2>/dev/null
 ui_print "  - 公钥目录 $KEYS_DIR"
 
 # 与旧的明文模块冲突检测
-if [ -d /data/adb/modules/adb_tcp5555 ]; then
-    ui_print " "
-    ui_print " !! 检测到 adb_tcp5555（明文 5555 模块）"
-    ui_print " !! 它会打开明文通道，本项目会主动关掉"
-    ui_print " !! 请先卸载那个模块再重启"
-    ui_print " "
-fi
+# 这两个模块的 system.prop 会打开明文 5555 并把 ro.adb.secure 置 0，
+# 直接绕过本项目的认证层，必须在重启前卸掉。
+for _m in adb_tcp5555 adbd_tcpip_unsec; do
+    if [ -d "/data/adb/modules/$_m" ]; then
+        ui_print " "
+        ui_print " !! 检测到 $_m"
+        ui_print " !! 它会打开明文 5555 并设 ro.adb.secure=0，"
+        ui_print " !! 直接绕过本项目的认证。请先卸载它再重启。"
+        ui_print " "
+    fi
+done
 
 # 顺手提示：sdcard 上已经有 adbkey.pub 的话，直接用
 for _c in /sdcard/adbkey.pub /sdcard/Download/adbkey.pub /sdcard/Documents/adbkey.pub; do
