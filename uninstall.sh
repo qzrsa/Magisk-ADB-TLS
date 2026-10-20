@@ -79,28 +79,29 @@ ip6tables -F ADB_GUARD6 2>/dev/null
 ip6tables -X ADB_GUARD6 2>/dev/null
 
 # 拆明文端口的来源白名单（v1.3.2 新增）。
-# 这个端口不属于本模块，是从 service.adb.tcp.port 读出来的，所以要单独取。
-_PP=$(getprop service.adb.tcp.port 2>/dev/null)
-case "$_PP" in
-    ''|*[!0-9]*) ;;
-    *)
-        _i=0
-        while [ "$_i" -lt 4 ]; do
-            iptables -D INPUT -p tcp --dport "$_PP" -j ADB_GUARD_P 2>/dev/null || break
-            _i=$((_i + 1))
-        done
-        iptables -F ADB_GUARD_P 2>/dev/null
-        iptables -X ADB_GUARD_P 2>/dev/null
-
-        _i=0
-        while [ "$_i" -lt 4 ]; do
-            ip6tables -D INPUT -p tcp --dport "$_PP" -j ADB_GUARD6_P 2>/dev/null || break
-            _i=$((_i + 1))
-        done
-        ip6tables -F ADB_GUARD6_P 2>/dev/null
-        ip6tables -X ADB_GUARD6_P 2>/dev/null
-        ;;
-esac
+# 这个端口不属于本模块，从 service.adb.tcp.port 读；属性可能已经被清空
+# （比如那个明文模块被禁用），所以再从 INPUT 上反查一遍残留钩子，避免漏拆。
+_PORTS=$(getprop service.adb.tcp.port 2>/dev/null)
+_PORTS="$_PORTS $(iptables -S INPUT 2>/dev/null | sed -n 's/.*--dport \([0-9][0-9]*\) -j ADB_GUARD_P.*/\1/p')"
+for _PP in $_PORTS; do
+    case "$_PP" in
+        ''|*[!0-9]*) continue ;;
+    esac
+    _i=0
+    while [ "$_i" -lt 4 ]; do
+        iptables -D INPUT -p tcp --dport "$_PP" -j ADB_GUARD_P 2>/dev/null || break
+        _i=$((_i + 1))
+    done
+    _i=0
+    while [ "$_i" -lt 4 ]; do
+        ip6tables -D INPUT -p tcp --dport "$_PP" -j ADB_GUARD6_P 2>/dev/null || break
+        _i=$((_i + 1))
+    done
+done
+iptables -F ADB_GUARD_P 2>/dev/null
+iptables -X ADB_GUARD_P 2>/dev/null
+ip6tables -F ADB_GUARD6_P 2>/dev/null
+ip6tables -X ADB_GUARD6_P 2>/dev/null
 
 # 清属性
 # 注意：**不要**清 service.adb.tcp.port。那是别的模块（如 adbd_tcpip_unsec）

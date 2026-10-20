@@ -39,6 +39,7 @@ ALLOW6=$(cfg ALLOW6_CIDR "")
 # 0 = 不碰它（默认）；1 = 只放行 lo + PLAINTEXT_ALLOW4，其余 DROP。
 GUARD_PLAINTEXT=$(cfg GUARD_PLAINTEXT 0)
 PLAINTEXT_ALLOW4=$(cfg PLAINTEXT_ALLOW4 "192.168.0.0/16 10.0.0.0/8 172.16.0.0/12")
+PLAINTEXT_ALLOW6=$(cfg PLAINTEXT_ALLOW6 "fe80::/10 fc00::/7")
 INTERVAL=$(cfg VERIFY_INTERVAL 60)
 ENSURE=$(cfg ENSURE_WIFI_DEBUG 0)
 KEYS_DIR=$(cfg KEYS_DIR /data/adb/adb_tls5555/keys)
@@ -323,12 +324,31 @@ plaintext_guard_port() {
     printf '%s' "$_gp"
 }
 
-guard_plaintext() {
-    [ "$GUARD_PLAINTEXT" = "1" ] || return 0
-    _p=$(plaintext_guard_port) || return 0
+# 规则是否完整：钩子在 INPUT 上 + 链里确实有 DROP 收尾。
+# 只看钩子是不够的 —— 链被刷空但钩子还在时，流量会「穿过空链」继续走，
+# 表现为「看起来配了、其实没防护」，这里要能识别出来并重建。
+plaintext_guard_ok() {
+    ipt -C INPUT -p tcp --dport "$1" -j ADB_GUARD_P 2>/dev/null || return 1
+    ipt -S ADB_GUARD_P 2>/dev/null | grep -q -- '^-A ADB_GUARD_P -j DROP' || return 1
+    return 0
+}
 
-    # 幂等：规则已经在就什么都不做，避免每 60 秒重写一遍 iptables
-    ipt -C INPUT -p tcp --dport "$_p" -j ADB_GUARD_P 2>/dev/null && return 0
+guard_plaintext() {
+    _p=$(plaintext_guard_port)
+
+    # 开关关掉（或压根没有明文端口）时，把可能残留的规则拆干净。
+    # PLAINTEXT_ALLOW4=any 表示「v4 不做限制」，等同于关掉整个功能。
+    # 只在钩子确实还在时才动 iptables，避免每轮空转。
+    if [ "$GUARD_PLAINTEXT" != "1" ] || [ -z "$_p" ] || [ "$PLAINTEXT_ALLOW4" = "any" ]; then
+        if [ -n "$_p" ] && ipt -C INPUT -p tcp --dport "$_p" -j ADB_GUARD_P 2>/dev/null; then
+            flush_plaintext_guard
+            log "INFO: 明文端口 $_p 的白名单已关闭（GUARD_PLAINTEXT=0 或 PLAINTEXT_ALLOW4=any）"
+        fi
+        return 0
+    fi
+
+    # 幂等：规则完整就什么都不做，避免每 60 秒重写一遍 iptables
+    plaintext_guard_ok "$_p" && return 0
 
     ipt -N ADB_GUARD_P 2>/dev/null
     ipt -F ADB_GUARD_P 2>/dev/null || return 1
@@ -356,18 +376,30 @@ guard_plaintext() {
     ipt -D INPUT -p tcp --dport "$_p" -j ADB_GUARD_P 2>/dev/null
     ipt -I INPUT 1 -p tcp --dport "$_p" -j ADB_GUARD_P 2>/dev/null
 
+    # IPv6：adbd 的 5555 是 [::] 双栈监听，不处理 v6 等于只防了一半。
     if command -v ip6tables >/dev/null 2>&1; then
-        if ! ip6t -C INPUT -p tcp --dport "$_p" -j ADB_GUARD6_P 2>/dev/null; then
-            ip6t -N ADB_GUARD6_P 2>/dev/null
-            ip6t -F ADB_GUARD6_P 2>/dev/null
-            ip6t -A ADB_GUARD6_P -i lo -j RETURN 2>/dev/null
-            ip6t -A ADB_GUARD6_P -j DROP 2>/dev/null
+        if [ "$PLAINTEXT_ALLOW6" = "any" ]; then
+            # 明确要求 v6 不限制：把可能残留的 v6 钩子拆掉
             ip6t -D INPUT -p tcp --dport "$_p" -j ADB_GUARD6_P 2>/dev/null
-            ip6t -I INPUT 1 -p tcp --dport "$_p" -j ADB_GUARD6_P 2>/dev/null
+            ip6t -F ADB_GUARD6_P 2>/dev/null
+            ip6t -X ADB_GUARD6_P 2>/dev/null
+        else
+            ip6t -N ADB_GUARD6_P 2>/dev/null
+            if ip6t -F ADB_GUARD6_P 2>/dev/null; then
+                ip6t -A ADB_GUARD6_P -i lo -j RETURN 2>/dev/null
+                for _c in $PLAINTEXT_ALLOW6; do
+                    ip6t -A ADB_GUARD6_P -s "$_c" -j RETURN 2>/dev/null
+                done
+                ip6t -A ADB_GUARD6_P -j DROP 2>/dev/null
+                ip6t -D INPUT -p tcp --dport "$_p" -j ADB_GUARD6_P 2>/dev/null
+                ip6t -I INPUT 1 -p tcp --dport "$_p" -j ADB_GUARD6_P 2>/dev/null
+            else
+                log "WARN: ip6tables 不可用，明文端口的 IPv6 未做限制"
+            fi
         fi
     fi
 
-    log "OK: 明文端口 $_p 已限制来源 —— 放行 lo + [${PLAINTEXT_ALLOW4}]，其余 DROP"
+    log "OK: 明文端口 $_p 已限制来源 —— v4 放行 lo + [${PLAINTEXT_ALLOW4}]，v6 放行 lo + [${PLAINTEXT_ALLOW6}]，其余 DROP"
     return 0
 }
 
@@ -397,15 +429,6 @@ apply_guard() {
     # 明文端口白名单与 GUARD_MODE 正交：不管 TLS 端口怎么管，
     # 明文端口该限还是限。
     guard_plaintext
-}
-
-guard_ok() {
-    [ "$MODE" = "all" ] && return 0
-    ipt -C INPUT -p tcp --dport "$PORT" -j ADB_GUARD 2>/dev/null || return 1
-    if command -v ip6tables >/dev/null 2>&1; then
-        ip6t -C INPUT -p tcp --dport "$PORT" -j ADB_GUARD6 2>/dev/null || return 1
-    fi
-    return 0
 }
 
 # ---- 失败自愈 / 自我禁用 -------------------------------------------------

@@ -445,7 +445,8 @@ INFO: 已启动后台复核，间隔 60s
 | `ALLOW4_CIDR` | `192.168.0.0/16 10.0.0.0/8 172.16.0.0/12` | `lan` 模式下放行的 IPv4 网段 |
 | `ALLOW6_CIDR` | 空 | `lan` 模式下放行的 IPv6 网段；空表示 v6 只放行 lo |
 | `GUARD_PLAINTEXT` | `0` | `1` = 给**明文端口**单独加来源白名单（与 `GUARD_MODE` 管的不是同一个端口） |
-| `PLAINTEXT_ALLOW4` | `192.168.0.0/16 10.0.0.0/8 172.16.0.0/12` | `GUARD_PLAINTEXT=1` 时放行的 IPv4 网段；`10.0.0.0/8` 已覆盖 EasyTier mesh |
+| `PLAINTEXT_ALLOW4` | `192.168.0.0/16 10.0.0.0/8 172.16.0.0/12` | `GUARD_PLAINTEXT=1` 时放行的 IPv4 网段；`10.0.0.0/8` 已覆盖 EasyTier mesh；填 `any` 等于关闭该功能 |
+| `PLAINTEXT_ALLOW6` | `fe80::/10 fc00::/7` | 同上，IPv6；adbd 是 `[::]` 双栈监听，不配 v6 等于只防一半；填 `any` 表示 v6 不限制 |
 | `VERIFY_INTERVAL` | `60` | 后台复核间隔（秒）；`0` 关闭复核 |
 | `ENSURE_WIFI_DEBUG` | `0` | 取不到 TLS 端口时是否自动打开系统「无线调试」开关 |
 | `KEYS_AUTO_INSTALL` | `1` | 是否自动把 `KEYS_DIR` 里的公钥合并进 `adb_keys`（`0` 关闭，只用 `adb pair`） |
@@ -650,7 +651,7 @@ bash tools/grant_key.sh her.pub
 
 | 版本 | 内容 |
 |---|---|
-| **v1.3.2** | 新增 `GUARD_PLAINTEXT`：可给**明文端口**（`service.adb.tcp.port`，通常是 5555）单独加 INPUT 来源白名单，实现「明文只走内网 / mesh，公网只留 TLS 端口」；规则幂等，复核循环会自动补回被刷掉的规则；`uninstall.sh` 同步清理 `ADB_GUARD_P` / `ADB_GUARD6_P` |
+| **v1.3.2** | 新增 `GUARD_PLAINTEXT`：可给**明文端口**（`service.adb.tcp.port`，通常是 5555）单独加 INPUT 来源白名单，实现「明文只走内网 / mesh，公网只留 TLS 端口」；规则幂等且可逆（改成 `0` 会自动拆除），复核循环自动补回被刷掉的规则；v4/v6 双栈都覆盖；`uninstall.sh` 同步清理 `ADB_GUARD_P` / `ADB_GUARD6_P`。**修复 `action.sh` 仍在清 `service.adb.tcp.port` 的老问题** —— 那会让明文通道消失，进而触发复核循环自我禁用模块 |
 | **v1.3.1** | 新增 `ensure_keys()`：系统框架每次认证成功后会按自己内存里的 key map 重写 `adb_keys`，把「从没连接过」的公钥清掉。复核循环每 60 s 补回缺失公钥（adbd 每次认证都重读文件，补写无需重启 adbd） |
 | **v1.3.0** | **删除 `system.prop`**：实测运行时 `setprop` 即可拉起 TLS 且与明文通道共存，模块从此在 `post-fs-data` 阶段零操作、不可能阻止开机；新增 `watchdog.sh` 独立看门狗、`.failcount` 电路熔断、端口冲突拒绝启动、`FORCE_SECURE` 开关；`uninstall.sh` 不再误清 `service.adb.tcp.port` |
 | **v1.2.2** | 修致命缺陷：后台复核发现 `service.adb.tls.port` 消失时会重新置位 `persist.adb.tls_server.enable` 并重启 adbd 自愈（带退避），不再永久失联 |

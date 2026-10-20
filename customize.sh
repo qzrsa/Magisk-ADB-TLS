@@ -9,7 +9,7 @@ KEYS_DIR=/data/adb/adb_tls5555/keys
 
 ui_print " "
 ui_print "*******************************"
-ui_print "  ADB TLS 固定端口  v1.3.0"
+ui_print "  ADB TLS 固定端口  v1.3.2"
 ui_print "*******************************"
 ui_print "  - adbd 以 TLS 模式监听"
 ui_print "  - adbd 的端口由系统随机分配，"

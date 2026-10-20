@@ -17,13 +17,15 @@ if install_client_keys; then
     restart_adbd
 fi
 
-# 1. 清掉明文通道
-if [ -n "$(getprop service.adb.tcp.port)" ]; then
-    resetprop -n service.adb.tcp.port "" 2>/dev/null || setprop service.adb.tcp.port ""
-    log "action: 已清除明文通道"
-fi
-
-# 2. 确保 TLS 能力开关
+# 1. 确保 TLS 能力开关
+#
+# ⚠ 这里**绝对不能**再去清 service.adb.tcp.port。
+#   v1.2.x 及更早的版本会清掉明文通道（那时模块想独占 5555）；
+#   v1.3.0 起明文通道是刻意保留的应急退路，uninstall.sh 也明确不清它。
+#   在这里清掉会造成连锁反应：
+#     adbd 下次重启后 5555 不再监听 → verify_loop 判定「明文通道没了」
+#     → revert_props + bump_fail + self_disable，模块在 60 秒内自我禁用。
+#   代码见 service.sh 的 verify_loop 与 watchdog.sh。
 if [ "$(getprop persist.adb.tls_server.enable)" != "1" ]; then
     setprop persist.adb.tls_server.enable 1
 fi
