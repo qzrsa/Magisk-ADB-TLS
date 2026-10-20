@@ -1,6 +1,6 @@
 # Magisk-ADB-TLS
 
-**当前版本 v1.3.0** ｜ [Releases](https://github.com/qzrsa/Magisk-ADB-TLS/releases)
+**当前版本 v1.3.2** ｜ [Releases](https://github.com/qzrsa/Magisk-ADB-TLS/releases)
 
 Magisk 模块：**开机确保 `adbd` 以 TLS 模式监听，并把固定的 `5555` 端口转发到它的实际端口。**
 
@@ -34,6 +34,76 @@ shutdown,lpm          # ← lpm = Low Power Mode，三星的低功耗黑屏/充�
 
 顺带一个实测数据：本机内核起到 TLS 就绪只要 **26–34 秒**。如果"开机很慢"，先怀疑设备压根没上电，
 而不是怀疑模块卡住了。
+
+---
+
+## 公网只留 TLS 端口，明文端口限内网
+
+很多机器上同时装着明文模块（`adbd_tcpip_unsec` 之类），会长期开着一个**不需要认证**的 5555。
+如果上游把 5555 映射到了公网，那等于给全世界开了一个 shell —— 就算开了 `FORCE_SECURE=1`，
+没预置公钥的客户端也会被反复推到「请求调试设备」弹窗，而无屏设备根本点不了。
+
+推荐的分工：
+
+| 端口 | 谁在用 | 暴露范围 | 拒绝方式 |
+|---|---|---|---|
+| **5556**（`ADB_TLS_PORT`） | TLS + 客户端证书 | 可以放到公网 | 握手阶段直接断，**不惊动系统** |
+| **5555**（`service.adb.tcp.port`） | 明文 + 无认证 | **只给内网 / mesh** | 未预置会被推到弹窗，无屏设备等于死路 |
+
+打开明文端口白名单：
+
+```ini
+# /data/adb/adb_tls5555.conf
+GUARD_PLAINTEXT=1
+PLAINTEXT_ALLOW4="192.168.0.0/16 10.0.0.0/8 172.16.0.0/12"
+```
+
+生效后 `iptables -S ADB_GUARD_P` 大致长这样：
+
+```
+-N ADB_GUARD_P
+-A ADB_GUARD_P -i lo -j RETURN
+-A ADB_GUARD_P -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+-A ADB_GUARD_P -s 192.168.0.0/16 -j RETURN
+-A ADB_GUARD_P -s 10.0.0.0/8 -j RETURN
+-A ADB_GUARD_P -s 172.16.0.0/12 -j RETURN
+-A ADB_GUARD_P -j DROP
+```
+
+`ADB_TLS_PORT` 不受这个开关影响，仍按 `GUARD_MODE` 走，所以「明文限内网 + TLS 走公网」可以同时成立。
+
+### 这条规则的覆盖边界
+
+它在 `late_start` 阶段才加上，**盖不住开机的头几十秒**。那段时间明文端口仍然是敞开的。
+
+要彻底关掉，得在**上游**动手 —— 路由器 / 中转机上把 `公网:5555 → 盒子:5555` 的映射删掉，
+或者改成 `公网:5556 → 盒子:5556`。这比任何盒子侧的规则都干净，而且连开机窗口一起解决。
+
+### 一个会让白名单失效的网络前提：路由器做了 SNAT
+
+实测遇到过这种情况：路由器把 `公网:5555` 转发到盒子时**顺手做了源地址转换**，
+于是盒子抓包看到的来源不是公网 IP，而是**路由器自己的内网地址**：
+
+```
+wlan0 In  IP 192.168.111.1.42773 > 192.168.111.111.5555
+             ^^^^^^^^^^^^^ 这是网关，不是真实客户端
+```
+
+更麻烦的是：如果客户端和管理机不在盒子同一个网段（比如盒在 `192.168.111.0/24`、
+PC 在 `192.168.11.0/24`），**PC 的流量也会经过同一个网关被 SNAT 成同一个地址**。
+结果就是——内网和公网在盒子上看起来完全一样，任何基于源 IP 的白名单都失去区分能力。
+
+判断方法：
+
+```sh
+# 在盒子上抓包，看 5555 的真实来源
+su -c 'tcpdump -i any -nn -c 6 "tcp port 5555"'
+```
+
+- 来源是客户端的**真实地址**（公网 IP 或各自的内网 IP）→ 白名单有效
+- 来源永远只有**网关地址**一个 → 路由器在做 SNAT，白名单无效，只能改上游映射
+
+这种情况下唯一的解法是改上游端口映射，盒子侧做什么都没用。
 
 ---
 
@@ -374,6 +444,8 @@ INFO: 已启动后台复核，间隔 60s
 | `GUARD_MODE` | `all` | `all` 不限来源；`lan` 只放行内网；`strict` 只放行 lo |
 | `ALLOW4_CIDR` | `192.168.0.0/16 10.0.0.0/8 172.16.0.0/12` | `lan` 模式下放行的 IPv4 网段 |
 | `ALLOW6_CIDR` | 空 | `lan` 模式下放行的 IPv6 网段；空表示 v6 只放行 lo |
+| `GUARD_PLAINTEXT` | `0` | `1` = 给**明文端口**单独加来源白名单（与 `GUARD_MODE` 管的不是同一个端口） |
+| `PLAINTEXT_ALLOW4` | `192.168.0.0/16 10.0.0.0/8 172.16.0.0/12` | `GUARD_PLAINTEXT=1` 时放行的 IPv4 网段；`10.0.0.0/8` 已覆盖 EasyTier mesh |
 | `VERIFY_INTERVAL` | `60` | 后台复核间隔（秒）；`0` 关闭复核 |
 | `ENSURE_WIFI_DEBUG` | `0` | 取不到 TLS 端口时是否自动打开系统「无线调试」开关 |
 | `KEYS_AUTO_INSTALL` | `1` | 是否自动把 `KEYS_DIR` 里的公钥合并进 `adb_keys`（`0` 关闭，只用 `adb pair`） |
@@ -578,6 +650,8 @@ bash tools/grant_key.sh her.pub
 
 | 版本 | 内容 |
 |---|---|
+| **v1.3.2** | 新增 `GUARD_PLAINTEXT`：可给**明文端口**（`service.adb.tcp.port`，通常是 5555）单独加 INPUT 来源白名单，实现「明文只走内网 / mesh，公网只留 TLS 端口」；规则幂等，复核循环会自动补回被刷掉的规则；`uninstall.sh` 同步清理 `ADB_GUARD_P` / `ADB_GUARD6_P` |
+| **v1.3.1** | 新增 `ensure_keys()`：系统框架每次认证成功后会按自己内存里的 key map 重写 `adb_keys`，把「从没连接过」的公钥清掉。复核循环每 60 s 补回缺失公钥（adbd 每次认证都重读文件，补写无需重启 adbd） |
 | **v1.3.0** | **删除 `system.prop`**：实测运行时 `setprop` 即可拉起 TLS 且与明文通道共存，模块从此在 `post-fs-data` 阶段零操作、不可能阻止开机；新增 `watchdog.sh` 独立看门狗、`.failcount` 电路熔断、端口冲突拒绝启动、`FORCE_SECURE` 开关；`uninstall.sh` 不再误清 `service.adb.tcp.port` |
 | **v1.2.2** | 修致命缺陷：后台复核发现 `service.adb.tls.port` 消失时会重新置位 `persist.adb.tls_server.enable` 并重启 adbd 自愈（带退避），不再永久失联 |
 | **v1.2.1** | 修 `adb_keys` 属主问题（不再无条件 `chown shell:shell`，否则 `AdbDebuggingManager` 失去写权限）；安装提示同时检出 `adbd_tcpip_unsec` |

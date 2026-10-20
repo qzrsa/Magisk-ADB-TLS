@@ -1,6 +1,6 @@
 #!/system/bin/sh
 #
-# adb_tls5555 / service.sh   v1.3.1
+# adb_tls5555 / service.sh   v1.3.2
 #
 # ⚠ 本版本**没有 system.prop**，一行都没有。这是刻意的：
 #
@@ -65,11 +65,15 @@ verify_loop() {
                 log "WARN: 仍未取到 TLS 端口，下轮再试"
             fi
         fi
+
+        # 明文端口白名单兜底：iptables 被系统/别的模块刷掉后能自己补回来。
+        # 函数内部先 -C 探测，规则在就什么都不做，不会每轮重写。
+        guard_plaintext
     done
 }
 
 main() {
-    log "===== service.sh 启动 (v1.3.1) ====="
+    log "===== service.sh 启动 (v1.3.2) ====="
 
     # ---- 0. 电路熔断 ----------------------------------------------------
     # 上次运行失败过就不要再试。每次失败都白白消耗一次开机，

@@ -35,6 +35,10 @@ PORT=$(cfg ADB_TLS_PORT 5555)
 MODE=$(cfg GUARD_MODE all)
 ALLOW4=$(cfg ALLOW4_CIDR "")
 ALLOW6=$(cfg ALLOW6_CIDR "")
+# 明文通道（bind 在 service.adb.tcp.port 上的那个端口）是否也加来源白名单。
+# 0 = 不碰它（默认）；1 = 只放行 lo + PLAINTEXT_ALLOW4，其余 DROP。
+GUARD_PLAINTEXT=$(cfg GUARD_PLAINTEXT 0)
+PLAINTEXT_ALLOW4=$(cfg PLAINTEXT_ALLOW4 "192.168.0.0/16 10.0.0.0/8 172.16.0.0/12")
 INTERVAL=$(cfg VERIFY_INTERVAL 60)
 ENSURE=$(cfg ENSURE_WIFI_DEBUG 0)
 KEYS_DIR=$(cfg KEYS_DIR /data/adb/adb_tls5555/keys)
@@ -297,6 +301,88 @@ flush_guard() {
     ip6t -X ADB_GUARD6 2>/dev/null
 }
 
+# ---- 明文通道的来源白名单 ----------------------------------------------
+#
+# adbd 的明文端口（service.adb.tcp.port，通常是 5555）不属于本模块，
+# 默认不碰。但它一旦被上游映射到公网，等于给全世界开了一个不需要认证的
+# shell；就算开了 ro.adb.secure=1，未预置的客户端也会不断触发
+# 「请求调试设备」弹窗，而这种无屏设备根本点不了。
+#
+# GUARD_PLAINTEXT=1 时给这个端口加一层 INPUT 白名单：
+#   lo 放行 → 已建立连接放行 → PLAINTEXT_ALLOW4 放行 → 其余 DROP
+# TLS 端口不受影响，仍按 GUARD_MODE 走。
+#
+# ⚠ 本规则在 late_start 阶段才加，**覆盖不到开机的头几十秒**。
+#   要彻底关掉公网暴露，还得在上游（路由器 / 中转机）把端口映射改掉。
+
+plaintext_guard_port() {
+    _gp=$(cat "$GUARDPORT" 2>/dev/null)
+    valid_port "$_gp" || return 1
+    # 明文端口和 TLS 端口是同一个监听时不重复处理
+    [ "$_gp" = "$PORT" ] && return 1
+    printf '%s' "$_gp"
+}
+
+guard_plaintext() {
+    [ "$GUARD_PLAINTEXT" = "1" ] || return 0
+    _p=$(plaintext_guard_port) || return 0
+
+    # 幂等：规则已经在就什么都不做，避免每 60 秒重写一遍 iptables
+    ipt -C INPUT -p tcp --dport "$_p" -j ADB_GUARD_P 2>/dev/null && return 0
+
+    ipt -N ADB_GUARD_P 2>/dev/null
+    ipt -F ADB_GUARD_P 2>/dev/null || return 1
+    ipt -A ADB_GUARD_P -i lo -j RETURN 2>/dev/null
+    # 已建立的连接放行（含上游做了 SNAT 的情况），不切断正在用的会话
+    ipt -A ADB_GUARD_P -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN 2>/dev/null \
+        || ipt -A ADB_GUARD_P -m state --state ESTABLISHED,RELATED -j RETURN 2>/dev/null
+    for _c in $PLAINTEXT_ALLOW4; do
+        ipt -A ADB_GUARD_P -s "$_c" -j RETURN 2>/dev/null
+    done
+    ipt -A ADB_GUARD_P -j DROP 2>/dev/null
+
+    # 挂到 INPUT 之前先自检：白名单网段必须真的写进去了。
+    # 否则这条链只剩 lo + 已建立 + DROP，会把所有新连接（包括自己的）挡死。
+    _want_n=0
+    for _c in $PLAINTEXT_ALLOW4; do _want_n=$((_want_n + 1)); done
+    _got_n=$(ipt -S ADB_GUARD_P 2>/dev/null | grep -c -- '^-A ADB_GUARD_P -s ')
+    if [ "$_want_n" -gt 0 ] && [ "${_got_n:-0}" -lt "$_want_n" ]; then
+        log "FAIL: 明文白名单网段只写入 ${_got_n:-0}/$_want_n 条，拒绝挂链（避免锁死）"
+        ipt -F ADB_GUARD_P 2>/dev/null
+        ipt -X ADB_GUARD_P 2>/dev/null
+        return 1
+    fi
+
+    ipt -D INPUT -p tcp --dport "$_p" -j ADB_GUARD_P 2>/dev/null
+    ipt -I INPUT 1 -p tcp --dport "$_p" -j ADB_GUARD_P 2>/dev/null
+
+    if command -v ip6tables >/dev/null 2>&1; then
+        if ! ip6t -C INPUT -p tcp --dport "$_p" -j ADB_GUARD6_P 2>/dev/null; then
+            ip6t -N ADB_GUARD6_P 2>/dev/null
+            ip6t -F ADB_GUARD6_P 2>/dev/null
+            ip6t -A ADB_GUARD6_P -i lo -j RETURN 2>/dev/null
+            ip6t -A ADB_GUARD6_P -j DROP 2>/dev/null
+            ip6t -D INPUT -p tcp --dport "$_p" -j ADB_GUARD6_P 2>/dev/null
+            ip6t -I INPUT 1 -p tcp --dport "$_p" -j ADB_GUARD6_P 2>/dev/null
+        fi
+    fi
+
+    log "OK: 明文端口 $_p 已限制来源 —— 放行 lo + [${PLAINTEXT_ALLOW4}]，其余 DROP"
+    return 0
+}
+
+flush_plaintext_guard() {
+    _p=$(cat "$GUARDPORT" 2>/dev/null)
+    valid_port "$_p" || _p=$(getprop service.adb.tcp.port)
+    valid_port "$_p" || return 0
+    ipt -D INPUT -p tcp --dport "$_p" -j ADB_GUARD_P 2>/dev/null
+    ipt -F ADB_GUARD_P 2>/dev/null
+    ipt -X ADB_GUARD_P 2>/dev/null
+    ip6t -D INPUT -p tcp --dport "$_p" -j ADB_GUARD6_P 2>/dev/null
+    ip6t -F ADB_GUARD6_P 2>/dev/null
+    ip6t -X ADB_GUARD6_P 2>/dev/null
+}
+
 apply_guard() {
     case "$MODE" in
         strict|lan)
@@ -308,6 +394,9 @@ apply_guard() {
             flush_guard
             ;;
     esac
+    # 明文端口白名单与 GUARD_MODE 正交：不管 TLS 端口怎么管，
+    # 明文端口该限还是限。
+    guard_plaintext
 }
 
 guard_ok() {

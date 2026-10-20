@@ -87,6 +87,15 @@ if [ "$IPT_OK" = "1" ]; then
         echo "--- filter ---"
         ipt -S ADB_GUARD 2>/dev/null || echo "(无防火墙链)"
     fi
+    if [ "$GUARD_PLAINTEXT" = "1" ]; then
+        _pp=$(plaintext_guard_port)
+        if [ -n "$_pp" ]; then
+            echo "--- 明文端口 $_pp 白名单 ---"
+            ipt -S ADB_GUARD_P 2>/dev/null || echo "(规则未生效)"
+        else
+            echo "--- 明文端口白名单：无明文端口，跳过 ---"
+        fi
+    fi
 else
     echo "--- iptables 不可用 ---"
 fi
