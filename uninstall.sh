@@ -79,8 +79,10 @@ ip6tables -F ADB_GUARD6 2>/dev/null
 ip6tables -X ADB_GUARD6 2>/dev/null
 
 # 清属性
+# 注意：**不要**清 service.adb.tcp.port。那是别的模块（如 adbd_tcpip_unsec）
+# 或用户自己开的明文通道，本模块从来没设置过它。清掉它会让对方的通道失效，
+# 在只有远程入口的设备上等于直接失联。
 resetprop -n service.adb.tls.port "" 2>/dev/null || setprop service.adb.tls.port ""
-resetprop -n service.adb.tcp.port "" 2>/dev/null || setprop service.adb.tcp.port ""
 resetprop --delete persist.adb.tls_server.enable 2>/dev/null || setprop persist.adb.tls_server.enable 0
 
 setprop ctl.restart adbd 2>/dev/null || {
@@ -90,6 +92,8 @@ setprop ctl.restart adbd 2>/dev/null || {
 }
 
 rm -f "$MODDIR/adb_tls.log" "$MODDIR/.tls_port" 2>/dev/null
+# 看门狗与自我禁用留下的痕迹
+rm -f "$MODDIR/.failcount" "$MODDIR/.guard_port" 2>/dev/null
 
 echo "adb_tls5555 已移除：NAT 与防火墙已拆除，adbd 已回 USB 模式"
 echo "配置保留在 $CONF，如需彻底清理可手动删除"

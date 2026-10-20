@@ -23,12 +23,14 @@ import zipfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # 只有这些文件会进 zip
+# 注意：v1.3.0 起**故意不含 system.prop**，也不含 post-fs-data.sh。
+# 模块在 post-fs-data 阶段不做任何事，因此不可能阻止开机。
 MODULE_FILES = [
     "module.prop",
-    "system.prop",
     "module.conf",
     "lib.sh",
     "service.sh",
+    "watchdog.sh",
     "action.sh",
     "uninstall.sh",
     "customize.sh",

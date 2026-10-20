@@ -39,6 +39,10 @@ INTERVAL=$(cfg VERIFY_INTERVAL 60)
 ENSURE=$(cfg ENSURE_WIFI_DEBUG 0)
 KEYS_DIR=$(cfg KEYS_DIR /data/adb/adb_tls5555/keys)
 AUTO_KEY=$(cfg KEYS_AUTO_INSTALL 1)
+# 是否强制开启认证（ro.adb.secure=1）。默认 0：先只加密不认证，确认链路通了再开。
+# 开启后**所有**通道（含明文 5555 和 USB）都要求公钥在 adb_keys 里，
+# 客户端公钥缺失会把自己也锁在外面 —— 所以默认不开。
+SECURE=$(cfg FORCE_SECURE 0)
 
 # adbd 的 keystore。TLS 客户端证书的公钥会逐条与这里比对。
 KEYSTORE=/data/misc/adb/adb_keys
@@ -313,6 +317,65 @@ guard_ok() {
         ip6t -C INPUT -p tcp --dport "$PORT" -j ADB_GUARD6 2>/dev/null || return 1
     fi
     return 0
+}
+
+# ---- 失败自愈 / 自我禁用 -------------------------------------------------
+#
+# 这一节是 v1.3.0 的核心保底。设计前提（已在真机验证）：
+#   - persist.adb.tls_server.enable=1 在**运行时**设置就能拉起 TLS，
+#     不需要重启 adbd，也不会顶掉已有的明文通道。所以它不该放进 system.prop。
+#   - service.sh 跑在 late_start，崩溃/卡死都不会阻止开机。
+#   - 由此，模块已经完全失去影响开机的能力，剩下的唯一风险是「把 adb 入口搞没」。
+#     下面所有逻辑都在保护同一件事：明文通道必须还在。
+
+FAILFILE="$MODDIR/.failcount"
+GUARDPORT="$MODDIR/.guard_port"
+
+# 记录明文通道端口，供 watchdog.sh 校验。空表示本来就没有明文通道可保护。
+plaintext_port() {
+    getprop service.adb.tcp.port
+}
+
+revert_props() {
+    log "INFO: 回滚 persist.adb.tls_server.enable=0"
+    setprop persist.adb.tls_server.enable 0
+}
+
+self_disable() {
+    log "FAIL: 自愈失败，写入 disable 自我禁用（下次启动不再加载本模块）"
+    : > "$MODDIR/disable"
+}
+
+fail_count() {
+    cat "$FAILFILE" 2>/dev/null | tr -dc '0-9' | head -c 4
+}
+
+bump_fail() {
+    _c=$(fail_count)
+    [ -z "$_c" ] && _c=0
+    echo $((_c + 1)) > "$FAILFILE"
+}
+
+clear_fail() {
+    rm -f "$FAILFILE"
+}
+
+# 明文通道是否还在。只有服务启动时存在明文通道才检查，避免误杀。
+plaintext_alive() {
+    _gp=$(cat "$GUARDPORT" 2>/dev/null)
+    [ -z "$_gp" ] && return 0
+    listening "$_gp"
+    _r=$?
+    [ "$_r" = "0" ] && return 0
+    # netstat/ss 都不可用时无法判定，按「活着」处理，不误杀
+    [ "$_r" = "2" ] && return 0
+    return 1
+}
+
+# 对外端口是否正被 adbd 的明文监听占用。
+# 是的话不能用 NAT REDIRECT 抢这个端口 —— 那会把别人的明文通道顶掉。
+port_taken_by_plaintext() {
+    [ "$(getprop service.adb.tcp.port)" = "$PORT" ]
 }
 
 # ---- 客户端公钥预置：免 6 位配对码 --------------------------------------
